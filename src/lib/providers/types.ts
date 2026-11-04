@@ -43,6 +43,8 @@ export interface SkipInterval {
 // getStream
 export interface Stream {
   server: string;
+  /** Release name, when the source reports one. */
+  title?: string;
   link: string;
   type: string;
   localBaseDir?: string;

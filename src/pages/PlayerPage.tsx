@@ -9,6 +9,11 @@ import { useLocation, useNavigate } from "react-router-dom";
 import {isTauriRuntime} from "../platform/host";
 import {supportsVlcLaunch} from "../platform/externalLinks";
 import type { MpvTrack } from "../lib/player/PlayerEngine";
+import { SourcePickerDialog } from "../components/player/SourcePickerDialog";
+import { TorrentStatusOverlay } from "../components/player/TorrentStatusOverlay";
+import { useTorrentStatusStore } from "../lib/zustand/torrentStatusStore";
+import { setTorrentEpisodeTarget, stopTorrentStatus } from "../lib/services/torrentStreamService";
+import { episodeTargetFromLink } from "../lib/player/episodeFile";
 import { usePlayerEngine } from "../lib/hooks/usePlayerEngine";
 import {useExitPresence} from '../lib/hooks/useExitPresence';
 import { useMpvPlayer } from "../lib/hooks/useMpvPlayer";
@@ -62,6 +67,8 @@ interface PlayerLocationState {
   infoUrl: string;
   doNotTrack?: boolean;
   localContent?: boolean;
+  /** Resume continues the source used before; Play asks for one. */
+  playbackMode?: "play" | "resume";
 }
 
 interface MediaTrackPreference {
@@ -352,6 +359,7 @@ const PlayerInner: React.FC<PlayerInnerProps> = ({ state }) => {
       doNotTrack: state.doNotTrack,
       localContent: state.localContent,
       poster: state.poster,
+      playbackMode: state.playbackMode,
     }),
     [state, activeEpisodeIndex],
   );
@@ -363,6 +371,10 @@ const PlayerInner: React.FC<PlayerInnerProps> = ({ state }) => {
     externalSubs,
     isLoading: streamLoading,
     error: streamError,
+    requiresServerSelection,
+    hiddenStreams,
+    checkingSwarms,
+    switchToNextStream,
   } = useStream({
     activeEpisode,
     routeParams,
@@ -405,6 +417,10 @@ const PlayerInner: React.FC<PlayerInnerProps> = ({ state }) => {
       externalSubs={externalSubs}
       routeParams={routeParams}
       hourglassSandColor={hourglassSandColor}
+      requiresServerSelection={requiresServerSelection}
+      hiddenStreams={hiddenStreams}
+      checkingSwarms={checkingSwarms}
+      switchToNextStream={switchToNextStream}
     />
   );
 };
@@ -771,8 +787,15 @@ const DesktopPlayer: React.FC<any> = ({
   externalSubs,
   routeParams,
   hourglassSandColor,
+  requiresServerSelection,
+  hiddenStreams,
+  checkingSwarms,
+  switchToNextStream,
 }) => {
   const navigate = useNavigate();
+  const torrentStatus = useTorrentStatusStore();
+  // The loading status belongs to this player; drop it when the player closes.
+  useEffect(() => () => stopTorrentStatus(), []);
   const { history, addItem, updatePlaybackInfo } = useWatchHistoryStore();
   const { provider } = useContentStore();
 
@@ -1120,7 +1143,10 @@ const DesktopPlayer: React.FC<any> = ({
       // magnet after a timeout repeats discovery and hides the real error.
       // Leave the source selected and let the user retry or choose a server.
       if (selectedStream?.type === 'torrent' || isTorrentUrl(currentLink)) {
-        toast(errorMsg || 'Torrent playback failed. Select another source or retry.', 5000);
+        stopTorrentStatus();
+        toast(errorMsg || 'Torrent playback failed. Select another source or retry.', 8000);
+        // Movies and episodes reopen the source list with the reason shown.
+        switchToNextStream?.();
         return;
       }
 
@@ -1190,6 +1216,7 @@ const DesktopPlayer: React.FC<any> = ({
   const engineOptions: Parameters<typeof usePlayerEngine>[1] = {
     onError: handlePlaybackError,
     onFileLoaded: () => {
+      stopTorrentStatus();
       if (playbackRateRef.current && playbackRateRef.current !== 1.0) {
         mpv.setPlaybackSpeed(playbackRateRef.current);
       }
@@ -1492,7 +1519,8 @@ const DesktopPlayer: React.FC<any> = ({
       });
       try {
         if (isTorrentUrl(selectedStream.link)) {
-          toast("Connecting to torrent...", 3500);
+          // The episode to stream from a season pack.
+          setTorrentEpisodeTarget(episodeTargetFromLink(activeEpisode?.link));
         }
         await mpv.loadFile(
           selectedStream.link,
@@ -2267,6 +2295,21 @@ const DesktopPlayer: React.FC<any> = ({
             playsInline
           />
         </div>
+      )}
+
+      {requiresServerSelection && !streamLoading && (
+        <SourcePickerDialog
+          streams={streamData}
+          hiddenStreams={hiddenStreams}
+          checking={checkingSwarms}
+          subtitle={state.type === "series" ? [state.primaryTitle, activeEpisode?.title].filter(Boolean).join(" · ") : state.primaryTitle}
+          onSelect={(stream) => handleStreamSelect(stream, true)}
+          onBack={() => navigate(-1)}
+        />
+      )}
+
+      {torrentStatus.active && !requiresServerSelection && (
+        <TorrentStatusOverlay title={torrentStatus.title} detail={torrentStatus.detail} startedAt={torrentStatus.startedAt} />
       )}
 
       {streamLoading && (

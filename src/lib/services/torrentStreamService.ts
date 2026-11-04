@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import {isTauriRuntime} from "../../platform/host";
+import { pickVideoFileIndex, type EpisodeTarget } from "../player/episodeFile";
+import { useTorrentStatusStore } from "../zustand/torrentStatusStore";
 
 export function isTorrentUrl(url?: string | null): boolean {
   if (!url) return false;
@@ -12,18 +14,6 @@ export function extractInfoHash(url?: string | null): string | null {
   const match = url.match(/urn:btih:([a-zA-Z0-9]+)/i);
   return match ? match[1].toLowerCase() : null;
 }
-
-const VIDEO_EXTENSIONS = [
-  ".mkv",
-  ".mp4",
-  ".avi",
-  ".webm",
-  ".mov",
-  ".m4v",
-  ".ts",
-  ".flv",
-  ".wmv",
-];
 
 export interface ResolveTorrentOptions {
   signal?: AbortSignal;
@@ -44,6 +34,82 @@ export function getInfoHashFromStreamUrl(streamUrl?: string | null): string | nu
   return match ? match[1].toLowerCase() : null;
 }
 
+// librqbit waits for a magnet's metadata inside POST /torrents, by default for
+// ten minutes. An attempt is cut short instead and added again: a fresh add
+// re-announces to trackers and the DHT, which is what re-opening a source did.
+const METADATA_TIMEOUT_MS = 30_000;
+const MAX_ADD_ATTEMPTS = 3;
+
+/** Season and episode the next torrent stream should play from a pack. */
+let episodeTarget: EpisodeTarget | undefined;
+export function setTorrentEpisodeTarget(target?: EpisodeTarget): void {
+  episodeTarget = target;
+}
+export function getTorrentEpisodeTarget(): EpisodeTarget | undefined {
+  return episodeTarget;
+}
+
+const status = () => useTorrentStatusStore.getState();
+
+const formatSpeed = (mbps?: number) =>
+  mbps && mbps > 0.01 ? (mbps >= 1 ? `${mbps.toFixed(1)} MB/s` : `${Math.round(mbps * 1024)} KB/s`) : "";
+
+/** Peers, speed and progress of a torrent librqbit already has. */
+export async function torrentStatsLine(apiPort: number, infoHash: string, signal?: AbortSignal): Promise<string> {
+  const res = await fetch(`http://127.0.0.1:${apiPort}/torrents/${infoHash}/stats/v1`, { signal });
+  if (!res.ok) return "";
+  const stats = await res.json();
+  const peers = stats?.live?.snapshot?.peer_stats;
+  const parts = [
+    peers ? `${peers.live || 0} peers connected (${peers.seen || 0} found)` : "",
+    formatSpeed(stats?.live?.download_speed?.mbps),
+    stats?.progress_bytes ? `${(stats.progress_bytes / 1024 / 1024).toFixed(1)} MB` : "",
+  ];
+  return parts.filter(Boolean).join(" · ");
+}
+
+/** Picks the file to stream: the requested episode in a pack, else the largest video. */
+export function pickTorrentFile(
+  files: Array<{ name: string; length?: number }>,
+  target?: EpisodeTarget,
+): number {
+  return pickVideoFileIndex(
+    files.map((file, index) => {
+      const path = file.name || "";
+      const name = path.substring(Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\")) + 1);
+      return { index, name, path, size: file.length || 0 };
+    }),
+    target,
+  );
+}
+
+async function addTorrent(apiPort: number, torrentUrl: string, signal?: AbortSignal) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener("abort", abort);
+  const timer = setTimeout(abort, METADATA_TIMEOUT_MS + 5_000);
+  try {
+    const res = await fetch(
+      `http://127.0.0.1:${apiPort}/torrents?overwrite=true&timeout_ms=${METADATA_TIMEOUT_MS}`,
+      { method: "POST", body: torrentUrl, signal: controller.signal },
+    );
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      throw new Error(errText || res.statusText || `HTTP ${res.status}`);
+    }
+    return await res.json();
+  } catch (error: any) {
+    if (signal?.aborted) throw error;
+    if (controller.signal.aborted || /timeout|timed out/i.test(String(error?.message))) {
+      throw new Error(`Peers did not send the torrent info in ${METADATA_TIMEOUT_MS / 1000} s.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
 /**
  * Resolves a magnet URL or .torrent into a local HTTP streaming URL served by librqbit.
  */
@@ -58,38 +124,50 @@ export async function resolveTorrentStream(
 
   const timeoutMs = options?.timeoutMs || 45_000;
   const signal = options?.signal;
+  const startedAt = Date.now();
+  status().set({ active: true, title: "Getting torrent info", detail: "Connecting to trackers and DHT", startedAt });
   options?.onProgress?.("Connecting to torrent network...");
 
   const apiPort = await invoke<number>("get_torrent_api_port");
 
-  // 1. Add torrent to librqbit session
-  const addRes = await fetch(`http://127.0.0.1:${apiPort}/torrents?overwrite=true`, {
-    method: "POST",
-    body: torrentUrl,
-    signal,
-  });
-
-  if (!addRes.ok) {
-    const errText = await addRes.text().catch(() => "");
-    throw new Error(`Failed to add torrent to librqbit: ${errText || addRes.statusText}`);
+  // 1. Add torrent to librqbit session, again if its metadata does not come.
+  let data: any;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      status().set({
+        title: "Getting torrent info",
+        detail: attempt > 1 ? `Trying again (${attempt}/${MAX_ADD_ATTEMPTS}) · asking trackers and DHT for peers` : "Connecting to trackers and DHT",
+      });
+      data = await addTorrent(apiPort, torrentUrl, signal);
+      break;
+    } catch (error: any) {
+      if (signal?.aborted || attempt >= MAX_ADD_ATTEMPTS) {
+        status().clear();
+        throw new Error(
+          `${error?.message || "The torrent could not be added."} Tried ${attempt} times. This release may be dead or blocked on your network; choose another source.`,
+        );
+      }
+    }
   }
-
-  const data = await addRes.json();
   const infoHash =
     data.details?.info_hash || extractInfoHash(torrentUrl) || (data.id !== undefined ? String(data.id) : null);
 
   if (!infoHash) {
+    status().clear();
     throw new Error("Failed to determine torrent info hash");
   }
 
   options?.onProgress?.("Waiting for torrent peers and metadata...");
+  status().set({ title: "Downloading the start of the video", detail: "" });
 
   // 2. Poll until torrent is active (live or paused) and files metadata is populated
   const startTime = Date.now();
   let torrentDetails: any = data.details;
+  let failure: Error | undefined;
 
-  while (Date.now() - startTime < timeoutMs) {
+  while (!failure && Date.now() - startTime < timeoutMs) {
     if (signal?.aborted) {
+      status().clear();
       throw new Error("Torrent stream resolution aborted");
     }
 
@@ -101,6 +179,10 @@ export async function resolveTorrentStream(
 
       if (statsRes.ok) {
         const stats = await statsRes.json();
+        if (stats.state === "error") {
+          failure = new Error(stats.error || "The torrent failed to start");
+          break;
+        }
         if (stats.state === "live" || stats.state === "paused") {
           // Verify we have file metadata
           if (!torrentDetails?.files || torrentDetails.files.length === 0) {
@@ -127,6 +209,10 @@ export async function resolveTorrentStream(
 
     await new Promise((r) => setTimeout(r, 600));
   }
+  if (failure) {
+    status().clear();
+    throw failure;
+  }
 
   // 3. Fallback check for files from /torrents/{infoHash}
   if (!torrentDetails?.files || torrentDetails.files.length === 0) {
@@ -147,38 +233,22 @@ export async function resolveTorrentStream(
     torrentDetails?.files || [];
 
   if (files.length === 0) {
+    status().clear();
     throw new Error(
       "Torrent metadata timeout: could not retrieve file list from peers. Try another source.",
     );
   }
 
-  // 4. Select the best media file (largest file with a video extension, or largest overall file)
-  let bestIndex = 0;
-  let bestFileName = files[0]?.name || "";
-  let maxVideoSize = 0;
-
-  files.forEach((f, idx) => {
-    const lowerName = (f.name || "").toLowerCase();
-    const isVideo = VIDEO_EXTENSIONS.some((ext) => lowerName.endsWith(ext));
-    const size = f.length || 0;
-
-    if (isVideo && size > maxVideoSize) {
-      maxVideoSize = size;
-      bestIndex = idx;
-      bestFileName = f.name;
-    }
-  });
-
-  if (maxVideoSize === 0) {
-    let maxOverallSize = 0;
-    files.forEach((f, idx) => {
-      const size = f.length || 0;
-      if (size > maxOverallSize) {
-        maxOverallSize = size;
-        bestIndex = idx;
-        bestFileName = f.name;
-      }
-    });
+  // 4. The requested episode of a season pack, else the largest video.
+  const bestIndex = pickTorrentFile(files, episodeTarget);
+  const bestFileName = files[bestIndex]?.name || "";
+  // Only that file downloads, so a 100 GB pack does not compete with the stream.
+  if (files.length > 1) {
+    fetch(`http://127.0.0.1:${apiPort}/torrents/${infoHash}/update_only_files`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ only_files: [bestIndex] }),
+    }).catch(() => {});
   }
 
   const rawName = bestFileName || "";
@@ -188,11 +258,35 @@ export async function resolveTorrentStream(
   const nameSuffix = baseName ? `/${encodeURIComponent(baseName)}` : "";
 
   activeStreamTorrents.add(infoHash.toLowerCase());
+  watchTorrentStatus(apiPort, infoHash);
 
   return {
     streamUrl: `http://127.0.0.1:${apiPort}/torrents/${infoHash}/stream/${bestIndex}${nameSuffix}`,
     infoHash,
   };
+}
+
+let statusWatch: ReturnType<typeof setInterval> | undefined;
+
+/** Keeps the loading screen's peers and speed current until playback starts. */
+export function watchTorrentStatus(apiPort: number, infoHash: string): void {
+  stopTorrentStatus(false);
+  const tick = () => {
+    torrentStatsLine(apiPort, infoHash)
+      .then((line) => {
+        if (status().active) status().set({ detail: line });
+      })
+      .catch(() => {});
+  };
+  tick();
+  statusWatch = setInterval(tick, 1000);
+}
+
+/** Playback started or the player closed: the loading status is no longer needed. */
+export function stopTorrentStatus(clear = true): void {
+  if (statusWatch) clearInterval(statusWatch);
+  statusWatch = undefined;
+  if (clear) status().clear();
 }
 
 /**

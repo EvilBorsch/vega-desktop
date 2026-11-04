@@ -351,9 +351,15 @@ export const MetaPage: React.FC = () => {
   );
   const [pendingResume, setPendingResume] = useState<{ season: string; episode: EpisodeIdentity } | null>(null);
 
-  const play = (items: Array<{ title: string; link: string }>, index: number, type: string) => {
+  const play = (
+    items: Array<{ title: string; link: string }>,
+    index: number,
+    type: string,
+    playbackMode: "play" | "resume" = "play",
+  ) => {
     navigate("/player", {
       state: {
+        playbackMode,
         episodeList: items,
         linkIndex: index,
         primaryTitle: title,
@@ -376,7 +382,7 @@ export const MetaPage: React.FC = () => {
     if (index < 0) return;
     const { position, duration } = readWatched(lastWatched, pendingResume.episode);
     const watched = duration > 0 && position / duration > WATCHED_FRACTION;
-    play(seasonItems, watched && seasonItems[index + 1] ? index + 1 : index, type);
+    play(seasonItems, watched && seasonItems[index + 1] ? index + 1 : index, type, "resume");
   }, [pendingResume, activeSeason, episodeList, episodeLoading]);
 
   const dialogDownloadedSubtitles = useMemo(() => {
@@ -765,7 +771,7 @@ export const MetaPage: React.FC = () => {
       localStorage.setItem(`vega_season_${link}`, lastSeason.title);
       return;
     }
-    if (resumeTarget?.index !== undefined) play(rows, resumeTarget.index, rowType);
+    if (resumeTarget?.index !== undefined) play(rows, resumeTarget.index, rowType, "resume");
   };
   const sortButton = showEpisodeSort ? (
     <FocusableButton

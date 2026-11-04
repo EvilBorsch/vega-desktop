@@ -14,8 +14,12 @@ export async function releaseMediaSource(source?: MediaSourceDescriptor): Promis
 export async function prepareMediaSource(source: MediaSourceDescriptor): Promise<MediaSourceDescriptor> {
   if (isTorrentSource(source.source,source.format)) {
     if (!isTauriRuntime()) return {...source,headers:undefined};
-    const {resolveTorrentStreamUrl} = await import('../lib/services/torrentStreamService');
-    return {...source,source:await resolveTorrentStreamUrl(source.source),format:undefined,headers:undefined};
+    const {resolveTorrentStream,deleteTorrentStream} = await import('../lib/services/torrentStreamService');
+    const {streamUrl,infoHash} = await resolveTorrentStream(source.source);
+    const delivered = {...source,source:streamUrl,format:undefined,headers:undefined};
+    // Without an owner the torrent kept downloading until the app closed.
+    if (infoHash) owners.set(delivered, () => deleteTorrentStream(infoHash));
+    return delivered;
   }
   if (isTauriRuntime()) {
     const {prepareTauriMediaSource} = await import('./tauri/mediaDelivery');

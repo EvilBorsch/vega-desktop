@@ -10,6 +10,7 @@ import {
   type MpvObservableProperty,
 } from "tauri-plugin-libmpv-api";
 import { settingsStorage } from "../storage/SettingsStorage";
+import { resolveTorrentStream } from "../services/torrentStreamService";
 import type { MpvChapter, MpvTrack } from "../player/PlayerEngine";
 
 /*
@@ -539,67 +540,14 @@ export const useMpvPlayer = (opts?: UseMpvPlayerOptions) => {
               currentActiveTorrentApiPort = apiPort;
               console.log("[MPV torrent] api port:", apiPort);
 
-              let infoHash = currentActiveTorrentInfoHash;
-              let torrentFiles: any[] = [];
-              if (currentActiveTorrentUrl !== url || !infoHash) {
-                console.log("[MPV debug] sending POST /torrents for:", url);
-                const addRes = await fetch(
-                  `http://127.0.0.1:${apiPort}/torrents`,
-                  {
-                    method: "POST",
-                    body: url,
-                    signal: abortController.signal,
-                  },
-                );
-
-                if (!addRes.ok) {
-                  throw new Error(
-                    `Failed to add torrent: ${addRes.status} ${await addRes.text()}`,
-                  );
-                }
-
-                console.log("[MPV debug] POST /torrents resolved");
-                const addData = await addRes.json();
-                infoHash = addData.details.info_hash;
-                torrentFiles = addData.details.files || [];
-                currentActiveTorrentInfoHash = infoHash;
-                currentActiveTorrentUrl = url;
-              }
-              // Wait for torrent to leave "initializing" state
-              const liveDeadline = Date.now() + 120000;
-              while (Date.now() < liveDeadline) {
-                if (abortController.signal.aborted) throw new Error("Aborted");
-                try {
-                  const statsRes = await fetch(
-                    `http://127.0.0.1:${apiPort}/torrents/${infoHash}/stats/v1`,
-                    { signal: abortController.signal },
-                  );
-                  if (statsRes.ok) {
-                    const stats = await statsRes.json();
-                    console.log("[MPV torrent] state:", stats.state);
-                    if (stats.state === "live" || stats.state === "paused")
-                      break;
-                    if (stats.state === "error")
-                      throw new Error(`Torrent error: ${stats.error}`);
-                  }
-                } catch (err: any) {
-                  if (err.name === "AbortError" || err.message === "Aborted")
-                    throw err;
-                }
-                await new Promise((r) => setTimeout(r, 500));
-              }
-
-              const fileId = 0;
-              const rawName = torrentFiles[0]?.name || "";
-              const fileName = rawName.substring(
-                Math.max(rawName.lastIndexOf("/"), rawName.lastIndexOf("\\")) +
-                  1,
-              );
-
-              const nameSuffix = fileName
-                ? `/${encodeURIComponent(fileName)}`
-                : "";
-              const streamUrl = `http://127.0.0.1:${apiPort}/torrents/${infoHash}/stream/${fileId}${nameSuffix}`;
+              // Same path as the other engines: a bounded metadata wait with
+              // re-adds, the requested episode of a season pack, live status.
+              const resolved = await resolveTorrentStream(url, { signal: abortController.signal });
+              const infoHash = resolved.infoHash;
+              currentActiveTorrentInfoHash = infoHash;
+              currentActiveTorrentUrl = url;
+              const streamUrl = resolved.streamUrl;
+              const fileId = Number(streamUrl.match(/\/stream\/(\d+)/)?.[1] || 0);
 
               // Warm up the stream — fetch the first chunk so librqbit
               // prioritizes downloading the beginning of the file.

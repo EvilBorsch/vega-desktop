@@ -825,6 +825,7 @@ pub fn run() {
             generate_video_thumbnail,
             local_content::list_local_directory,
             get_torrent_api_port,
+            torrent::probe_swarms,
             download_manager::start_download,
             download_manager::pause_download,
             download_manager::cancel_download,

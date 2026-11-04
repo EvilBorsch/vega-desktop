@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {isTauriRuntime} from "../../platform/host";
 
@@ -7,6 +7,18 @@ import { providerManager } from "../services/ProviderManager";
 import { settingsStorage } from "../storage";
 
 import { Stream } from "../providers/types";
+import { fetchExtraTorrentStreams, mergeTrackerStreams } from "../providers/extraTorrentSources";
+import {
+  findRememberedServer,
+  findSimilarStream,
+  rememberedIdentity,
+  rememberedSeriesKey,
+  rememberedServerKey,
+  rememberServer,
+  serverIdentity,
+  type ServerIdentity,
+} from "../player/rememberedServer";
+import { streamInfoHash, useSwarmHealth } from "../player/swarmHealth";
 import {
   useDownloadStore,
   isVideoDownloadItem,
@@ -177,8 +189,9 @@ export const useStream = ({
   );
 
   const {
-    data: streamData = EMPTY_STREAMS,
+    data: listedStreams = EMPTY_STREAMS,
     isLoading,
+    isFetching,
     error,
     refetch,
   } = useQuery<Stream[], Error>({
@@ -208,17 +221,29 @@ export const useStream = ({
         return localStream ? [localStream] : [];
       }
 
-      // Fetch streams from provider
+      // Fetch streams from provider. Torrentio lists only RuTracker and Rutor
+      // among Russian trackers, so JacRed and international indexes add the
+      // other releases of the same title.
       let data: Stream[] = [];
+      const providerValue = routeParams?.providerValue || provider;
+      const controller = new AbortController();
+      const extraStreams = providerValue === "torrentio"
+        ? fetchExtraTorrentStreams(remoteLink, routeParams?.type, controller.signal)
+        : Promise.resolve([] as Stream[]);
       try {
-        const controller = new AbortController();
-        data =
-          (await providerManager.getStream({
-            link: remoteLink,
-            type: routeParams?.type,
-            signal: controller.signal,
-            providerValue: routeParams?.providerValue || provider,
-          })) || [];
+        try {
+          data =
+            (await providerManager.getStream({
+              link: remoteLink,
+              type: routeParams?.type,
+              signal: controller.signal,
+              providerValue,
+            })) || [];
+        } catch (providerError) {
+          if (!(await extraStreams).length) throw providerError;
+          console.warn("Provider streams failed; showing tracker releases:", providerError);
+        }
+        data = mergeTrackerStreams(data, await extraStreams);
       } catch (error) {
         if (localStream) {
           console.warn(
@@ -264,12 +289,85 @@ export const useStream = ({
     refetchOnWindowFocus: false,
   });
 
-  // Update selected stream when data changes
+  // Movies and episodes open on a source list; Resume continues the source
+  // used before and the next episode continues the release just watched.
+  const choosesSource =
+    !routeParams?.localContent &&
+    (routeParams?.type === "movie" || routeParams?.type === "series");
+  const serverKey = rememberedServerKey(activeEpisode, routeParams, provider);
+  const seriesKey = rememberedSeriesKey(routeParams, provider);
+  const episodeKey = activeEpisode?.link || activeEpisode?.title || "";
+  const awaitingSourceChoice = useRef(false);
+  const sessionChoiceRef = useRef<ServerIdentity | undefined>(undefined);
+  const episodeSwitchedRef = useRef(false);
+  const previousEpisodeKeyRef = useRef(episodeKey);
+  if (previousEpisodeKeyRef.current !== episodeKey) {
+    previousEpisodeKeyRef.current = episodeKey;
+    episodeSwitchedRef.current = true;
+    awaitingSourceChoice.current = false;
+  }
+
+  // Releases nobody shares are hidden once the DHT has been asked. The one
+  // playing and the ones Resume would pick stay, whatever the probe says.
+  const selectedLink = selectedStream?.link;
+  const keepReleases = useMemo(() => new Set([
+    selectedLink,
+    streamInfoHash(selectedStream),
+    rememberedIdentity(serverKey)?.torrentHash,
+    rememberedIdentity(seriesKey)?.torrentHash,
+  ].filter((value): value is string => Boolean(value))),
+  [selectedLink, serverKey, seriesKey]);
+  const swarm = useSwarmHealth(listedStreams, {enabled: choosesSource, keep: keepReleases});
+  const streamData = swarm.visible;
+
+  const selectStream = useCallback((selection: React.SetStateAction<Stream>) => {
+    awaitingSourceChoice.current = false;
+    setSelectedStream(current => {
+      const next = typeof selection === "function" ? selection(current) : selection;
+      rememberServer(serverKey, next);
+      if (next.type !== "local") {
+        rememberServer(seriesKey, next);
+        sessionChoiceRef.current = serverIdentity(next) || sessionChoiceRef.current;
+      }
+      return next;
+    });
+  }, [serverKey, seriesKey]);
+
+  // A new episode starts with no source until one is chosen or matched.
   useEffect(() => {
-    if (streamData && streamData.length > 0) {
-      setSelectedStream(streamData[0]);
-    }
-  }, [streamData]);
+    setSelectedStream({ server: "", link: "", type: "" });
+  }, [episodeKey]);
+
+  useEffect(() => {
+    if (!streamData || streamData.length === 0) return;
+    setSelectedStream(current => {
+      if (current?.link && streamData.some(stream => stream.link === current.link)) return current;
+      if (current?.link) {
+        // New links for the chosen source: the same torrent or the same server.
+        const hash = streamInfoHash(current);
+        const replacement = hash
+          ? streamData.find(stream => streamInfoHash(stream) === hash)
+          : streamData.find(stream => stream.server === current.server && stream.quality === current.quality);
+        if (replacement || !choosesSource) return replacement || streamData[0];
+      }
+      // A downloaded or local file plays without asking.
+      if (streamData[0]?.type === "local") return streamData[0];
+      if (!choosesSource) return streamData[0];
+      if (awaitingSourceChoice.current || isFetching) return { server: "", link: "", type: "" };
+      const remembered = episodeSwitchedRef.current
+        ? findSimilarStream(sessionChoiceRef.current, streamData)
+        : routeParams?.playbackMode === "resume"
+          ? findRememberedServer(serverKey, streamData) ||
+            findSimilarStream(rememberedIdentity(seriesKey), streamData)
+          : undefined;
+      if (remembered) {
+        rememberServer(serverKey, remembered);
+        sessionChoiceRef.current = serverIdentity(remembered);
+        return remembered;
+      }
+      return { server: "", link: "", type: "" };
+    });
+  }, [streamData, choosesSource, isFetching, routeParams?.playbackMode, serverKey, seriesKey]);
 
   // Extract downloaded and online external subtitles
   useEffect(() => {
@@ -325,6 +423,13 @@ export const useStream = ({
   }, [error]);
 
   const switchToNextStream = () => {
+    // Movies and episodes go back to the source list rather than switching
+    // quality behind the viewer's back.
+    if (choosesSource) {
+      awaitingSourceChoice.current = true;
+      setSelectedStream({ server: "", link: "", type: "" });
+      return true;
+    }
     if (streamData && streamData.length > 0) {
       const currentIndex = streamData.indexOf(selectedStream);
       if (currentIndex < streamData.length - 1) {
@@ -339,10 +444,16 @@ export const useStream = ({
   return {
     streamData,
     selectedStream,
-    setSelectedStream,
+    setSelectedStream: selectStream,
+    requiresServerSelection: choosesSource && !selectedStream.link && !error && streamData.length > 0,
+    /** Releases hidden because nobody shares them; the source list can show them. */
+    hiddenStreams: swarm.hidden,
+    checkingSwarms: swarm.checking,
+    markReleaseDead: swarm.markDead,
     externalSubs,
     setExternalSubs,
-    isLoading,
+    // Resume waits for fresh results before matching the remembered source.
+    isLoading: isLoading || (choosesSource && !selectedStream.link && isFetching),
     error,
     refetch,
     switchToNextStream,
