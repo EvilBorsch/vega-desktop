@@ -1,10 +1,9 @@
 use axum::serve::Listener;
 use futures_util::StreamExt;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,7 +12,7 @@ use librqbit::dht::Id20;
 use librqbit::http_api::{HttpApi, HttpApiOptions};
 use librqbit::http_api_types::PeerStatsFilter;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, ListenerMode, ListenerOptions, Magnet,
+    AddTorrent, AddTorrentOptions, ListenerMode, ListenerOptions, Magnet,
     ManagedTorrent, Session, SessionOptions,
 };
 use serde::Serialize;
@@ -48,24 +47,34 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 /// Peers that are enough to call a release alive.
 const PROBE_ENOUGH_PEERS: usize = 8;
 
-/// A swarm test reads this much of the main video file, then stops.
-const TEST_BYTES: u64 = 12 * 1024 * 1024;
-const TEST_POLL: Duration = Duration::from_millis(500);
-/// Speed samples averaged for the result: the last three seconds.
-const TEST_SPEED_SAMPLES: usize = 6;
-/// Time after the torrent info a test keeps measuring, and how far past its
-/// budget it may go for releases whose info came late.
-const TEST_MIN_DATA_WINDOW: Duration = Duration::from_secs(8);
-const TEST_EXTRA_WINDOW: Duration = Duration::from_secs(12);
+/// A monitored release downloads this much of its main video, then stops.
+const TEST_BYTES: u64 = 24 * 1024 * 1024;
+/// How long a monitored release may take to send its torrent info.
+const MONITOR_METADATA_TIMEOUT: Duration = Duration::from_secs(50);
 /// Peer addresses kept, to hand playback the peers that answered.
 const TEST_PEER_LIST: usize = 40;
 
-/// Swarm tests in flight: the releases picked for playback stay in the
-/// session, and leaving the source list stops the others.
+/// What the monitor has seen of a release since it was added.
+struct MonitorEntry {
+    added_at: Instant,
+    /// Added by the monitor (not already playing), so removed when it stops.
+    owned: bool,
+    handle: Option<Arc<ManagedTorrent>>,
+    metadata_at: Option<Instant>,
+    bytes_at_metadata: u64,
+    bytes: u64,
+    max_rate: f64,
+    max_peers: usize,
+    known: usize,
+    peer_list: Vec<String>,
+}
+
+/// Releases measured while a source list is open; the ones picked for
+/// playback stay in the session when measuring stops.
 #[derive(Default)]
 pub struct SwarmTests {
     claimed: Mutex<HashSet<String>>,
-    generation: AtomicU32,
+    monitored: Mutex<HashMap<String, MonitorEntry>>,
 }
 
 impl SwarmTests {
@@ -181,18 +190,23 @@ pub async fn probe_swarms(
     Ok(results)
 }
 
-/// What briefly joining a release's swarm showed. Speeds are bytes per second;
-/// `seeds` is -1 because librqbit does not say which peers have every piece.
-#[derive(Serialize, Default)]
+/// How a monitored release is doing right now. Speeds are bytes per second;
+/// seeds are -1 because librqbit does not say which peers have every piece.
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SwarmTestResult {
+pub struct LiveSample {
+    metadata: bool,
+    elapsed_ms: u64,
+    data_ms: u64,
+    bytes: u64,
+    rate: f64,
+    max_rate: f64,
     peers: usize,
     seeds: i64,
+    max_peers: usize,
+    max_seeds: i64,
     known: usize,
-    metadata: bool,
-    metadata_ms: u64,
-    speed: f64,
-    max_speed: f64,
+    done: bool,
     peer_list: Vec<String>,
 }
 
@@ -201,12 +215,6 @@ fn torrent_state<'a>(state: &'a tauri::State<'_, Option<TorrentState>>) -> Resul
         .inner()
         .as_ref()
         .ok_or_else(|| "Torrent service is not available".to_string())
-}
-
-async fn wait_cancelled(tests: &SwarmTests, generation: u32) {
-    while tests.generation.load(Ordering::SeqCst) == generation {
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
 }
 
 /// Index of the largest file: the video a stream would read.
@@ -224,165 +232,179 @@ fn largest_file(handle: &ManagedTorrent) -> Option<usize> {
         .flatten()
 }
 
-async fn test_swarm(
-    session: Arc<Session>,
-    tests: Arc<SwarmTests>,
-    generation: u32,
-    magnet: String,
-    id: Id20,
-    budget: Duration,
-) -> SwarmTestResult {
-    let hash = id.as_string();
-    let started = Instant::now();
-    let hard_deadline = started + budget + TEST_EXTRA_WINDOW;
-    let mut result = SwarmTestResult {
-        seeds: -1,
-        ..Default::default()
-    };
-    // The playing release (or one picked meanwhile) is measured, never removed.
-    let preexisting = session.get(TorrentIdOrHash::Hash(id)).is_some();
-    let add = session.add_torrent(
-        AddTorrent::from_url(magnet),
-        Some(AddTorrentOptions {
-            overwrite: true,
-            ..Default::default()
-        }),
-    );
-    let added = match futures_util::future::select(
-        Box::pin(tokio::time::timeout(budget + TEST_EXTRA_WINDOW, add)),
-        Box::pin(wait_cancelled(&tests, generation)),
-    )
-    .await
-    {
-        futures_util::future::Either::Left((added, _)) => added.ok().and_then(|added| added.ok()),
-        futures_util::future::Either::Right(_) => None,
-    };
-    let release = |session: Arc<Session>, tests: Arc<SwarmTests>, hash: String| async move {
-        if preexisting || tests.is_claimed(&hash) {
-            return;
-        }
-        // A cancelled add can still have registered the torrent.
-        if session.get(TorrentIdOrHash::Hash(id)).is_some() {
-            let _ = session.delete(TorrentIdOrHash::Hash(id), true).await;
-        }
-    };
-    let Some(added) = added else {
-        release(session, tests, hash).await;
-        return result;
-    };
-    let (handle, owned) = match added {
-        AddTorrentResponse::Added(_, handle) => (handle, !preexisting),
-        AddTorrentResponse::AlreadyManaged(_, handle) => (handle, false),
-        AddTorrentResponse::ListOnly(_) => return result,
-    };
-    result.metadata = true;
-    result.metadata_ms = started.elapsed().as_millis() as u64;
-    if owned && !tests.is_claimed(&hash) {
-        // Read the start of the main video, as playback would.
-        if let Some(largest) = largest_file(&handle) {
-            let _ = session.update_only_files(&handle, &HashSet::from([largest])).await;
-        }
-    }
-    let metadata_at = Instant::now();
-    // A release whose info came late still gets a few seconds of data.
-    let deadline = (started + budget).max(metadata_at + TEST_MIN_DATA_WINDOW).min(hard_deadline);
-    // Bytes peers sent in this test. `progress_bytes` is no measure: it jumps
-    // when the file selection changes.
-    let mut start_bytes: Option<u64> = if owned { Some(0) } else { None };
-    let mut samples = VecDeque::with_capacity(TEST_SPEED_SAMPLES);
-    let mut fetched = 0u64;
-    while Instant::now() < deadline && tests.generation.load(Ordering::SeqCst) == generation {
-        tokio::time::sleep(TEST_POLL).await;
-        let stats = handle.stats();
-        if let Some(live) = &stats.live {
-            let bytes = live.snapshot.fetched_bytes;
-            fetched = bytes.saturating_sub(*start_bytes.get_or_insert(bytes));
-            let peers = &live.snapshot.peer_stats;
-            result.peers = result.peers.max(peers.live as usize);
-            result.known = result.known.max(peers.seen as usize);
-            let speed = live.download_speed.mbps * 1024.0 * 1024.0;
-            result.max_speed = result.max_speed.max(speed);
-            if samples.len() == TEST_SPEED_SAMPLES {
-                samples.pop_front();
+/// Starts measuring releases while a source list is open: each one not
+/// already in the session is added in the background and downloads the
+/// start of its main video. Nothing is decided here; `swarm_stats` reports
+/// how each is doing and `stop_swarm_monitor` ends it.
+#[tauri::command]
+pub async fn monitor_swarms(state: tauri::State<'_, Option<TorrentState>>, magnets: Vec<String>) -> Result<(), String> {
+    let torrent = torrent_state(&state)?;
+    for magnet in magnets {
+        let Some(id) = Magnet::parse(&magnet).ok().and_then(|parsed| parsed.as_id20()) else {
+            continue;
+        };
+        let hash = id.as_string();
+        // A release already in the session (playing) is measured as it is.
+        let existing = torrent.session.get(TorrentIdOrHash::Hash(id));
+        {
+            let mut monitored = torrent.tests.monitored.lock().map_err(|_| "Swarm monitor is unavailable".to_string())?;
+            if monitored.contains_key(&hash) {
+                continue;
             }
-            samples.push_back(speed);
+            monitored.insert(
+                hash.clone(),
+                MonitorEntry {
+                    added_at: Instant::now(),
+                    owned: existing.is_none(),
+                    handle: existing.clone(),
+                    metadata_at: None,
+                    bytes_at_metadata: 0,
+                    bytes: 0,
+                    max_rate: 0.0,
+                    max_peers: 0,
+                    known: 0,
+                    peer_list: Vec::new(),
+                },
+            );
         }
-        if let Some(live) = handle.live() {
-            for addr in live.per_peer_stats_snapshot(PeerStatsFilter::default()).peers.into_keys() {
-                if result.peer_list.len() < TEST_PEER_LIST && !result.peer_list.contains(&addr) {
-                    result.peer_list.push(addr);
+        if existing.is_some() {
+            continue;
+        }
+        let session = torrent.session.clone();
+        let tests = torrent.tests.clone();
+        tauri::async_runtime::spawn(async move {
+            let add = session.add_torrent(
+                AddTorrent::from_url(magnet),
+                Some(AddTorrentOptions {
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            );
+            let handle = match tokio::time::timeout(MONITOR_METADATA_TIMEOUT, add).await {
+                Ok(Ok(response)) => response.into_handle(),
+                _ => None,
+            };
+            let Some(handle) = handle else { return };
+            let watched = tests
+                .monitored
+                .lock()
+                .map(|mut monitored| match monitored.get_mut(&hash) {
+                    Some(entry) => {
+                        entry.handle = Some(handle.clone());
+                        true
+                    }
+                    None => false,
+                })
+                .unwrap_or(false);
+            if !watched {
+                // Measuring stopped while the info was on its way.
+                if !tests.is_claimed(&hash) {
+                    let _ = session.delete(TorrentIdOrHash::Hash(id), true).await;
+                }
+                return;
+            }
+            if !tests.is_claimed(&hash) {
+                // Only the start of the main video, as playback would read it.
+                if let Some(largest) = largest_file(&handle) {
+                    let _ = session.update_only_files(&handle, &HashSet::from([largest])).await;
+                }
+            }
+        });
+    }
+    Ok(())
+}
+
+/// How each monitored release is doing; bytes and dataMs count from the
+/// moment its torrent info arrived.
+#[tauri::command]
+pub fn swarm_stats(state: tauri::State<'_, Option<TorrentState>>, hashes: Vec<String>) -> Result<HashMap<String, LiveSample>, String> {
+    let torrent = torrent_state(&state)?;
+    let mut monitored = torrent.tests.monitored.lock().map_err(|_| "Swarm monitor is unavailable".to_string())?;
+    let now = Instant::now();
+    let mut samples = HashMap::new();
+    for hash in hashes {
+        let hash = hash.to_lowercase();
+        let Some(entry) = monitored.get_mut(&hash) else { continue };
+        let mut peers = 0;
+        let mut rate = 0.0;
+        if let Some(handle) = entry.handle.clone() {
+            let stats = handle.stats();
+            let fetched = stats.live.as_ref().map(|live| live.snapshot.fetched_bytes).unwrap_or(0);
+            if entry.metadata_at.is_none() {
+                entry.metadata_at = Some(now);
+                entry.bytes_at_metadata = fetched;
+            }
+            if let Some(live) = &stats.live {
+                entry.bytes = fetched.saturating_sub(entry.bytes_at_metadata);
+                peers = live.snapshot.peer_stats.live as usize;
+                entry.known = entry.known.max(live.snapshot.peer_stats.seen as usize);
+                rate = live.download_speed.mbps * 1024.0 * 1024.0;
+                entry.max_rate = entry.max_rate.max(rate);
+                entry.max_peers = entry.max_peers.max(peers);
+            }
+            if let Some(live) = handle.live() {
+                for addr in live.per_peer_stats_snapshot(PeerStatsFilter::default()).peers.into_keys() {
+                    if entry.peer_list.len() < TEST_PEER_LIST && !entry.peer_list.contains(&addr) {
+                        entry.peer_list.push(addr);
+                    }
                 }
             }
         }
-        if stats.finished || (owned && fetched >= TEST_BYTES) {
-            break;
+        samples.insert(
+            hash,
+            LiveSample {
+                metadata: entry.metadata_at.is_some(),
+                elapsed_ms: now.duration_since(entry.added_at).as_millis() as u64,
+                data_ms: entry.metadata_at.map(|at| now.duration_since(at).as_millis() as u64).unwrap_or(0),
+                bytes: entry.bytes,
+                rate,
+                max_rate: entry.max_rate,
+                peers,
+                seeds: -1,
+                max_peers: entry.max_peers,
+                max_seeds: -1,
+                known: entry.known,
+                done: entry.bytes >= TEST_BYTES * 95 / 100,
+                peer_list: entry.peer_list.clone(),
+            },
+        );
+    }
+    Ok(samples)
+}
+
+/// Ends measuring these releases. The ones the monitor added go, with what
+/// they downloaded, unless the player took them over.
+#[tauri::command]
+pub async fn stop_swarm_monitor(state: tauri::State<'_, Option<TorrentState>>, hashes: Vec<String>) -> Result<(), String> {
+    let torrent = torrent_state(&state)?;
+    let removed: Vec<(String, bool)> = {
+        let mut monitored = torrent.tests.monitored.lock().map_err(|_| "Swarm monitor is unavailable".to_string())?;
+        hashes
+            .iter()
+            .filter_map(|hash| {
+                let hash = hash.to_lowercase();
+                monitored.remove(&hash).map(|entry| (hash, entry.owned))
+            })
+            .collect()
+    };
+    for (hash, owned) in removed {
+        if !owned || torrent.tests.is_claimed(&hash) {
+            continue;
+        }
+        let Ok(id) = Id20::from_str(&hash) else { continue };
+        if torrent.session.get(TorrentIdOrHash::Hash(id)).is_some() {
+            let _ = torrent.session.delete(TorrentIdOrHash::Hash(id), true).await;
         }
     }
-    let average = if samples.is_empty() {
-        0.0
-    } else {
-        samples.iter().sum::<f64>() / samples.len() as f64
-    };
-    // A fast release can read the whole test in a second or two, before the
-    // speed estimate catches up; the bytes it fetched say the same.
-    let elapsed = metadata_at.elapsed().as_secs_f64().max(0.5);
-    result.speed = average.max(fetched as f64 / elapsed);
-    if owned {
-        release(session, tests, hash).await;
-    }
-    result
+    Ok(())
 }
 
-/// Joins each release's swarm for a few seconds and measures it: peers that
-/// connected, how fast the start of the video arrived. Releases not picked
-/// meanwhile are removed afterwards with what they downloaded.
-#[tauri::command]
-pub async fn test_swarms(
-    state: tauri::State<'_, Option<TorrentState>>,
-    magnets: Vec<String>,
-    seconds: u64,
-) -> Result<HashMap<String, SwarmTestResult>, String> {
-    let torrent = torrent_state(&state)?;
-    let session = torrent.session.clone();
-    let tests = torrent.tests.clone();
-    let generation = tests.generation.load(Ordering::SeqCst);
-    let budget = Duration::from_secs(seconds.clamp(3, 30));
-    let mut seen = HashSet::new();
-    let jobs: Vec<_> = magnets
-        .into_iter()
-        .filter_map(|magnet| {
-            let id = Magnet::parse(&magnet).ok()?.as_id20()?;
-            seen.insert(id).then(|| (id, magnet))
-        })
-        .map(|(id, magnet)| {
-            let session = session.clone();
-            let tests = tests.clone();
-            async move {
-                let result = test_swarm(session, tests, generation, magnet, id, budget).await;
-                (id.as_string(), result)
-            }
-        })
-        .collect();
-    let results: HashMap<String, SwarmTestResult> = futures_util::future::join_all(jobs).await.into_iter().collect();
-    let working = results.values().filter(|result| result.peers > 0).count();
-    vlog_debug!("[torrent] Swarm test: {}/{} releases connected to peers", working, results.len());
-    Ok(results)
-}
-
-/// Keeps a tested release in the session: it is about to be played.
+/// Keeps a measured release in the session: it is about to be played.
 #[tauri::command]
 pub fn claim_swarm_test(state: tauri::State<'_, Option<TorrentState>>, info_hash: String) -> Result<(), String> {
     let torrent = torrent_state(&state)?;
     if let Ok(mut claimed) = torrent.tests.claimed.lock() {
         claimed.insert(info_hash.to_lowercase());
     }
-    Ok(())
-}
-
-/// Stops the tests in flight; their releases are removed.
-#[tauri::command]
-pub fn cancel_swarm_tests(state: tauri::State<'_, Option<TorrentState>>) -> Result<(), String> {
-    let torrent = torrent_state(&state)?;
-    torrent.tests.generation.fetch_add(1, Ordering::SeqCst);
     Ok(())
 }

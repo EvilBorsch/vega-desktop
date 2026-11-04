@@ -1,4 +1,4 @@
-import {useEffect} from 'react';
+import {useEffect, useMemo, useRef} from 'react';
 import {create} from 'zustand';
 import {invoke} from '@tauri-apps/api/core';
 import type {Stream} from '../providers/types';
@@ -6,26 +6,70 @@ import {isTauriRuntime} from '../../platform/host';
 import {liveSeeders, streamInfoHash} from './swarmHealth';
 import {streamLanguages, streamQuality} from './streamFilters';
 
-/** What briefly joining a release's swarm showed (Rust `test_swarms`). */
+/** What measuring a release's swarm showed. */
 export type SwarmTestResult = {
-  /** Peers that connected and peers trackers/DHT named. */
+  /** Peers that connected and peers trackers/DHT named; seeds among them (-1: unknown). */
   peers: number;
-  /** Seeds among the peers; -1 when the engine cannot tell. */
   seeds: number;
   known: number;
   metadata: boolean;
-  /** Bytes per second over the last seconds of the test, and the peak. */
+  /** Bytes per second since the torrent info arrived, and the peak rate. */
   speed: number;
   maxSpeed: number;
   /** Addresses of peers that connected, to hand playback straight away. */
   peerList: string[];
   testedAt: number;
+  /** Still being measured: an estimate from the seconds so far. */
+  provisional?: boolean;
 };
 
-/** Candidates tested at once; enough to fill the first screen of the list. */
+/** How a monitored release is doing right now (the native swarmStats). */
+export type LiveSample = {
+  metadata: boolean;
+  /** Since the release was added, and since its torrent info arrived. */
+  elapsedMs: number;
+  dataMs: number;
+  /** Video bytes since the torrent info arrived; the current and peak rate. */
+  bytes: number;
+  rate: number;
+  maxRate: number;
+  peers: number;
+  seeds: number;
+  maxPeers: number;
+  maxSeeds: number;
+  known: number;
+  /** The start of the video (24 MB) is in. */
+  done: boolean;
+  peerList: string[];
+};
+
+/** Releases looked at in each pass: the top of the list. */
 export const SWARM_TEST_BATCH = 8;
-// Releases whose torrent info comes late are measured a little longer.
-export const SWARM_TEST_SECONDS = 12;
+/**
+ * Releases downloading at the same time. A stalled one does not hold a slot:
+ * it is still watched, but the next release starts beside it.
+ */
+export const MONITOR_CONCURRENCY = 6;
+/** Releases watched at most, stalled ones included. */
+export const MAX_MONITORED = 16;
+// No torrent info this long, or no video this long after it: stalled.
+const STALL_NO_INFO_MS = 8_000;
+const STALL_NO_DATA_MS = 6_000;
+// A release this fast for this long, and not falling off, is judged at once.
+const CLEAR_SPEED = 1024 * 1024;
+const CLEAR_AFTER_MS = 6_000;
+// BitTorrent is slow to start: a new peer is often let in only by an
+// "optimistic unchoke" that rotates every 30 s, and small swarms can take
+// minutes. A release that sends video is judged after 30 s; one that sends
+// nothing is watched in the background for up to 2 minutes, or until its place
+// is needed after 45 s.
+export const MEASURE_WINDOW_MS = 30_000;
+export const GIVE_UP_MS = 120_000;
+export const EVICT_AFTER_MS = 45_000;
+// Video that makes a 30-second measurement meaningful.
+const MIN_MEASURED_BYTES = 2 * 1024 * 1024;
+// The speed so far ranks a release once it has had this long.
+const PROVISIONAL_AFTER_MS = 8_000;
 // Swarms change slowly; a result stays useful for the next choices, also
 // after the app restarts.
 const RESULT_TTL_MS = 30 * 60 * 1000;
@@ -54,6 +98,11 @@ const save = (results: Record<string, SwarmTestResult>) => {
 type SwarmTestState = {
   results: Record<string, SwarmTestResult>;
   running: Record<string, true>;
+  /** Releases being measured, with their latest numbers. */
+  live: Record<string, LiveSample | undefined>;
+  update: (stats: Record<string, LiveSample>) => void;
+  /** Stops measuring these releases without a result. */
+  drop: (hashes: string[]) => void;
   /** Failed tests per release; one that did not answer is tested once more. */
   failures: Record<string, number>;
   start: (hashes: string[]) => void;
@@ -65,8 +114,26 @@ type SwarmTestState = {
 export const useSwarmTestStore = create<SwarmTestState>(set => ({
   results: loadSaved(),
   running: {},
+  live: {},
   failures: {},
-  start: hashes => set(state => ({running: {...state.running, ...Object.fromEntries(hashes.map(hash => [hash, true as const]))}})),
+  start: hashes => set(state => ({
+    running: {...state.running, ...Object.fromEntries(hashes.map(hash => [hash, true as const]))},
+    live: {...state.live, ...Object.fromEntries(hashes.map(hash => [hash, undefined]))},
+  })),
+  update: stats => set(state => {
+    const live = {...state.live};
+    for (const [hash, sample] of Object.entries(stats)) if (hash in live) live[hash] = sample;
+    return {live};
+  }),
+  drop: hashes => set(state => {
+    const running = {...state.running};
+    const live = {...state.live};
+    for (const hash of hashes) {
+      delete running[hash];
+      delete live[hash];
+    }
+    return {running, live};
+  }),
   recheck: hashes => set(state => {
     const results = {...state.results};
     const failures = {...state.failures};
@@ -79,7 +146,11 @@ export const useSwarmTestStore = create<SwarmTestState>(set => ({
   }),
   finish: (hashes, results) => set(state => {
     const running = {...state.running};
-    for (const hash of hashes) delete running[hash];
+    const live = {...state.live};
+    for (const hash of hashes) {
+      delete running[hash];
+      delete live[hash];
+    }
     const now = Date.now();
     const next = {...state.results};
     const failures = {...state.failures};
@@ -88,9 +159,61 @@ export const useSwarmTestStore = create<SwarmTestState>(set => ({
       if (!result.metadata) failures[hash] = (failures[hash] || 0) + 1;
     }
     save(next);
-    return {running, results: next, failures};
+    return {running, live, results: next, failures};
   }),
 }));
+
+/** Bytes per second since the torrent info arrived. */
+export const sampleSpeed = (sample: LiveSample) =>
+  sample.dataMs > 0 ? (sample.bytes * 1000) / Math.max(1000, sample.dataMs) : 0;
+
+const sampleResult = (sample: LiveSample): Omit<SwarmTestResult, 'testedAt'> => ({
+  peers: sample.maxPeers,
+  seeds: sample.maxSeeds,
+  known: sample.known,
+  metadata: sample.metadata,
+  speed: sampleSpeed(sample),
+  maxSpeed: sample.maxRate,
+  peerList: sample.peerList || [],
+});
+
+/** Whether a monitored release is downloading, still starting, or stalled. */
+export const sampleState = (sample?: LiveSample): 'starting' | 'downloading' | 'stalled' => {
+  if (!sample) return 'starting';
+  if (!sample.metadata) return sample.elapsedMs >= STALL_NO_INFO_MS ? 'stalled' : 'starting';
+  if (sample.rate >= NO_DATA_SPEED) return 'downloading';
+  return sample.dataMs >= STALL_NO_DATA_MS ? 'stalled' : 'starting';
+};
+
+/**
+ * The result of a release once its speed is clear: the start of its video is
+ * in, it has been fast and steady for a few seconds, or it sent video for
+ * 30 s. A release that sends nothing keeps being watched in the background,
+ * without holding up the others, for up to 2 minutes.
+ */
+export const settleSample = (sample: LiveSample): Omit<SwarmTestResult, 'testedAt'> | undefined => {
+  if (sample.elapsedMs >= GIVE_UP_MS) return sampleResult(sample);
+  if (!sample.metadata) return undefined;
+  if (sample.done || (sample.dataMs >= MEASURE_WINDOW_MS && sample.bytes >= MIN_MEASURED_BYTES)) return sampleResult(sample);
+  const speed = sampleSpeed(sample);
+  const steady = sample.dataMs >= CLEAR_AFTER_MS && speed >= CLEAR_SPEED && sample.rate >= speed * 0.7;
+  return steady ? sampleResult(sample) : undefined;
+};
+
+/** Final results plus the estimates of releases measured for a few seconds. */
+export const withProvisional = (
+  results: Record<string, SwarmTestResult>,
+  live: Record<string, LiveSample | undefined>,
+): Record<string, SwarmTestResult> => {
+  const now = Date.now();
+  let merged: Record<string, SwarmTestResult> | undefined;
+  for (const [hash, sample] of Object.entries(live)) {
+    if (!sample?.metadata || sample.dataMs < PROVISIONAL_AFTER_MS) continue;
+    merged = merged || {...results};
+    merged[hash] = {...sampleResult(sample), testedAt: now, provisional: true};
+  }
+  return merged || results;
+};
 
 export const freshResult = (results: Record<string, SwarmTestResult>, hash?: string): SwarmTestResult | undefined => {
   const result = hash ? results[hash] : undefined;
@@ -138,6 +261,8 @@ export const sortBySpeed = (streams: Stream[], results: Record<string, SwarmTest
     if (stream.type !== 'torrent') return {tier: 0, speed: Number.MAX_SAFE_INTEGER};
     const speed = expectedSpeed(stream, result);
     if (!result) return {tier: 1, speed};
+    // A release still ramping up stays among the unmeasured until it is fast.
+    if (result.provisional) return speed >= GOOD_SPEED ? {tier: 0, speed} : {tier: 1, speed: Math.max(speed, expectedSpeed(stream))};
     return {tier: speed < 0 ? 3 : speed >= GOOD_SPEED ? 0 : 2, speed};
   };
   const quality = (stream: Stream) => Number(streamQuality(stream)) || 0;
@@ -158,8 +283,24 @@ export const formatSpeed = (bytesPerSecond: number) =>
 
 export type TestLine = {text: string; tone: 'good' | 'ok' | 'bad' | 'pending'};
 
-/** One line for a release card: what the swarm test found. */
-export const describeTest = (result?: SwarmTestResult, running = false): TestLine | undefined => {
+const peersText = (peers: number, seeds: number) => (seeds >= 0 ? `${peers} peers (${seeds} seeds)` : `${peers} peers`);
+
+/** One line for a release card: what measuring it found, or how it is going. */
+export const describeTest = (
+  result?: SwarmTestResult,
+  running = false,
+  live?: LiveSample,
+): {text: string; tone: 'good' | 'ok' | 'bad' | 'pending'} | undefined => {
+  if (live && (!result || result.provisional)) {
+    const stalled = sampleState(live) === 'stalled';
+    if (!live.metadata) {
+      return {text: stalled ? `No torrent info yet · ${live.known} peers known · still trying` : `Getting torrent info… ${live.known} peers known`, tone: 'pending'};
+    }
+    if (!live.bytes) {
+      return {text: stalled ? `No video yet · ${peersText(live.peers, live.seeds)} · still trying` : `Connecting… ${peersText(live.peers, live.seeds)}`, tone: 'pending'};
+    }
+    return {text: `Measuring… ${formatSpeed(sampleSpeed(live))} · ${peersText(live.peers, live.seeds)}`, tone: 'pending'};
+  }
   if (!result) return running ? {text: 'Checking peers and speed…', tone: 'pending'} : undefined;
   if (!result.metadata) {
     return result.peers > 0
@@ -170,7 +311,7 @@ export const describeTest = (result?: SwarmTestResult, running = false): TestLin
   // Next to nothing arrived: say so instead of a speed of "1 KB/s".
   if (Math.max(result.speed, result.maxSpeed * 0.5) < NO_DATA_SPEED) {
     const seeds = result.seeds >= 0 ? ` (${result.seeds} seeds)` : '';
-    return {text: `No video data in the test · ${result.peers} peers${seeds} connected`, tone: 'bad'};
+    return {text: `No video data in ${MEASURE_WINDOW_MS / 1000} s · ${result.peers} peers${seeds} connected`, tone: 'bad'};
   }
   const speed = Math.max(result.speed, result.maxSpeed * 0.5);
   const peers = result.seeds >= 0 ? `${result.peers} peers (${result.seeds} seeds)` : `${result.peers} peers connected`;
@@ -211,7 +352,7 @@ export const slowLanguageHint = (
   const measured = listed
     .filter(stream => stream.type === 'torrent')
     .map(stream => freshResult(results, streamInfoHash(stream)))
-    .filter((result): result is SwarmTestResult => Boolean(result));
+    .filter((result): result is SwarmTestResult => Boolean(result) && !result!.provisional);
   const torrents = listed.filter(stream => stream.type === 'torrent').length;
   if (!measured.length || measured.length < Math.min(3, torrents)) return undefined;
   const best = Math.max(0, ...measured.map(result => (testFailed(result) ? 0 : Math.max(result.speed, result.maxSpeed * 0.5))));
@@ -225,7 +366,10 @@ export const testProgress = (streams: Stream[], results: Record<string, SwarmTes
   const hashes = [...new Set(streams.filter(stream => stream.type === 'torrent').map(streamInfoHash).filter(Boolean))] as string[];
   return {
     total: hashes.length,
-    tested: hashes.filter(hash => freshResult(results, hash)).length,
+    tested: hashes.filter(hash => {
+      const result = freshResult(results, hash);
+      return Boolean(result && !result.provisional);
+    }).length,
     testing: hashes.filter(hash => running[hash]).length,
   };
 };
@@ -266,28 +410,84 @@ export const claimSwarmTest = async (stream: Stream): Promise<void> => {
 };
 
 /**
- * Tests the top of a source list while it is shown: the first untested
- * releases, a batch at a time, until the releases at the top are all measured.
- * Leaving the list stops the tests.
+ * Measures the top of a source list while it is shown, without blocking it:
+ * up to six releases at a time download the start of their video, their
+ * numbers are read every second, and a release that has been measured long
+ * enough makes room for the next one down the (re-sorted) list. Leaving the
+ * list stops it.
  */
 export const useSwarmTests = (streams: Stream[], enabled: boolean) => {
   const results = useSwarmTestStore(state => state.results);
-  const running = useSwarmTestStore(state => state.running);
-  const failures = useSwarmTestStore(state => state.failures);
-  const busy = Object.keys(running).length > 0;
+  const live = useSwarmTestStore(state => state.live);
+  const streamsRef = useRef(streams);
+  streamsRef.current = streams;
   useEffect(() => {
-    if (!enabled || busy || !isTauriRuntime()) return;
-    const hashes = nextToTest(streams.slice(0, SWARM_TEST_BATCH * 2), results, running, failures);
-    if (!hashes.length) return;
-    const magnets = hashes.map(hash => streams.find(stream => streamInfoHash(stream) === hash)!.link);
-    const {start, finish} = useSwarmTestStore.getState();
-    start(hashes);
-    invoke<Record<string, Omit<SwarmTestResult, 'testedAt'>>>('test_swarms', {magnets, seconds: SWARM_TEST_SECONDS})
-      .then(found => finish(hashes, found || {}))
-      .catch(() => finish(hashes, {}));
-  }, [streams, enabled, busy, results, running, failures]);
-  useEffect(() => () => {
-    if (isTauriRuntime()) invoke('cancel_swarm_tests').catch(() => {});
-  }, []);
-  return {results, running};
+    if (!enabled || !isTauriRuntime()) return;
+    let stopped = false;
+    let busy = false;
+    const tick = async () => {
+      if (busy || stopped) return;
+      busy = true;
+      try {
+        const active = Object.keys(useSwarmTestStore.getState().live);
+        if (active.length) {
+          const stats: Record<string, LiveSample> = await invoke<Record<string, LiveSample>>('swarm_stats', {hashes: active}).catch(() => ({}));
+          if (stopped) return;
+          const settled: Record<string, Omit<SwarmTestResult, 'testedAt'>> = {};
+          for (const hash of active) {
+            const result = stats[hash] && settleSample(stats[hash]);
+            if (result) settled[hash] = result;
+          }
+          useSwarmTestStore.getState().update(stats);
+          const done = Object.keys(settled);
+          if (done.length) {
+            useSwarmTestStore.getState().finish(done, settled);
+            invoke('stop_swarm_monitor', {hashes: done}).catch(() => {});
+          }
+        }
+        let state = useSwarmTestStore.getState();
+        const list = streamsRef.current;
+        const busySlots = Object.values(state.live).filter(sample => sampleState(sample) !== 'stalled').length;
+        let wanted = nextToTest(list.slice(0, MAX_MONITORED + SWARM_TEST_BATCH), state.results, state.running, state.failures)
+          .slice(0, Math.max(0, MONITOR_CONCURRENCY - busySlots));
+        // Watching is full: the release stalled longest gives its place.
+        const room = MAX_MONITORED - Object.keys(state.live).length;
+        if (wanted.length > room) {
+          const evict = Object.entries(state.live)
+            .filter((entry): entry is [string, LiveSample] => Boolean(entry[1]) && sampleState(entry[1]) === 'stalled' && entry[1]!.elapsedMs >= EVICT_AFTER_MS)
+            .sort(([, a], [, b]) => b.elapsedMs - a.elapsedMs)
+            .slice(0, wanted.length - room);
+          if (evict.length) {
+            const ended = Object.fromEntries(evict.map(([hash, sample]) => [hash, sampleResult(sample)]));
+            state.finish(Object.keys(ended), ended);
+            invoke('stop_swarm_monitor', {hashes: Object.keys(ended)}).catch(() => {});
+            state = useSwarmTestStore.getState();
+          }
+          wanted = wanted.slice(0, Math.max(0, MAX_MONITORED - Object.keys(state.live).length));
+        }
+        const hashes = wanted;
+        if (!hashes.length) return;
+        const magnets = hashes.map(hash => list.find(stream => streamInfoHash(stream) === hash)!.link);
+        state.start(hashes);
+        await invoke('monitor_swarms', {magnets}).catch(() => useSwarmTestStore.getState().drop(hashes));
+      } finally {
+        busy = false;
+      }
+    };
+    const timer = setInterval(tick, 1000);
+    tick();
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+      const active = Object.keys(useSwarmTestStore.getState().live);
+      useSwarmTestStore.getState().drop(active);
+      if (active.length) invoke('stop_swarm_monitor', {hashes: active}).catch(() => {});
+    };
+  }, [enabled]);
+  const running = useMemo(
+    () => Object.fromEntries(Object.keys(live).map(hash => [hash, true as const])) as Record<string, true>,
+    [live],
+  );
+  const effective = useMemo(() => withProvisional(results, live), [results, live]);
+  return {results: effective, running, live};
 };

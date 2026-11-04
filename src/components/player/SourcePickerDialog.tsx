@@ -103,11 +103,11 @@ export const SourcePickerDialog: React.FC<{
   );
   // Test in the order shown before the results arrive: best swarms first.
   const candidates = useMemo(() => sortBySpeed(matching, {}, sort), [matching, sort]);
-  const { results, running } = useSwarmTests(candidates, true);
+  const { results, running, live } = useSwarmTests(candidates, true);
   const listed = useMemo(() => sortBySpeed(matching, results, sort), [matching, results, sort]);
   const progress = testProgress(listed, results, running);
   const progressText = describeProgress(progress);
-  const hint = progress.testing ? undefined : slowLanguageHint(listed, streams, results, languages);
+  const hint = slowLanguageHint(listed, streams, results, languages);
   // Swarms change: measure the listed releases again.
   const recheck = () =>
     useSwarmTestStore.getState().recheck(listed.map(streamInfoHash).filter((hash): hash is string => Boolean(hash)));
@@ -194,7 +194,7 @@ export const SourcePickerDialog: React.FC<{
                 <div style={{ marginBottom: 10 }} aria-label={progressText}>
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <div style={{ fontSize: 12, color: "var(--on-surface-variant)", flex: 1 }}>{progressText}</div>
-                    {!progress.testing && (
+                    {progress.tested > 0 && (
                       <FocusableButton focusKey="SOURCE_RECHECK" aria-label="Check the speed of these releases again" onClick={recheck} style={chip(false)}>
                         ↻ Recheck
                       </FocusableButton>
@@ -216,7 +216,7 @@ export const SourcePickerDialog: React.FC<{
               <div style={{ flex: 1, overflowY: "auto", paddingRight: 4 }}>
                 {listed.map((stream, index) => {
                   const hash = streamInfoHash(stream);
-                  const test = describeTest(freshResult(results, hash), Boolean(hash && running[hash]));
+                  const test = describeTest(freshResult(results, hash), Boolean(hash && running[hash]), hash ? live[hash] : undefined);
                   // Stable per release, so focus stays on it when the list re-sorts.
                   const itemKey = hash ? `${hash}_${stream.server}` : `${index}`;
                   return (
