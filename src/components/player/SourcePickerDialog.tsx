@@ -3,7 +3,17 @@ import { useFocusable, FocusContext } from "@noriginmedia/norigin-spatial-naviga
 import { LuArrowLeft as ArrowLeft, LuPlay as Play } from "react-icons/lu";
 import type { Stream } from "../../lib/providers/types";
 import { filterStreams, getStreamFilterOptions } from "../../lib/player/streamFilters";
-import { streamBadges } from "../../lib/player/streamBadges";
+import { badgeLabel, streamBadges } from "../../lib/player/streamBadges";
+import { streamInfoHash } from "../../lib/player/swarmHealth";
+import {
+  claimSwarmTest,
+  describeTest,
+  freshResult,
+  sortBySpeed,
+  useSwarmTests,
+  type SourceSort,
+  type TestLine,
+} from "../../lib/player/swarmTests";
 import { FocusableButton } from "../layout/FocusableButton";
 
 const chip = (active: boolean): React.CSSProperties => ({
@@ -21,6 +31,23 @@ const qualityLabel = (quality: string) =>
 const languageLabel = (language: string) =>
   language === "UNKNOWN" ? "Unspecified" : language === "MULTI" ? "Multi" : language;
 
+const TEST_COLORS: Record<TestLine["tone"], string> = {
+  good: "#7FD8A8",
+  ok: "#F2C46D",
+  bad: "#FF8A80",
+  pending: "var(--on-surface-variant)",
+};
+
+/** What the swarm test measured: speed and peers, or why it will not play. */
+function TestResult({ line }: { line: TestLine }) {
+  const icon = line.tone === "pending" ? "⏳" : line.tone === "bad" ? "⚠" : "⚡";
+  return (
+    <div style={{ fontSize: 13, fontWeight: 600, color: TEST_COLORS[line.tone], marginBottom: 8 }}>
+      {icon} {line.text}
+    </div>
+  );
+}
+
 function Badge({ text }: { text: string }) {
   const seeders = text.match(/^(?:👤\s*|S:\s*)(\d+)$/i)?.[1];
   const online = text.match(/^👥\s*(\d+)$/)?.[1];
@@ -37,14 +64,16 @@ function Badge({ text }: { text: string }) {
         color: live ? "#A5E8C8" : dead ? "#FFB4AB" : quality ? "var(--on-primary-container)" : "var(--on-surface-variant)",
       }}
     >
-      {seeders !== undefined ? `${seeders} seeders` : online !== undefined ? `${online} peers online` : text}
+      {badgeLabel(text)}
     </span>
   );
 }
 
 /**
  * The source list a movie or an episode opens on: quality and language
- * filters, each release with its tracker, name, seeders and size.
+ * filters, each release with its tracker, name, seeders and size. The top
+ * releases are joined for a few seconds to measure peers and speed, and the
+ * list is ordered by what that measured.
  */
 export const SourcePickerDialog: React.FC<{
   streams: Stream[];
@@ -58,11 +87,22 @@ export const SourcePickerDialog: React.FC<{
   const [qualities, setQualities] = useState<string[]>([]);
   const [languages, setLanguages] = useState<string[]>([]);
   const [showHidden, setShowHidden] = useState(false);
+  const [sort, setSort] = useState<SourceSort>("speed");
   const options = useMemo(() => getStreamFilterOptions(streams), [streams]);
-  const listed = useMemo(
+  const matching = useMemo(
     () => filterStreams(showHidden ? [...streams, ...hiddenStreams] : streams, qualities, languages),
     [streams, hiddenStreams, showHidden, qualities, languages],
   );
+  // Test in the order shown before the results arrive: best swarms first.
+  const candidates = useMemo(() => sortBySpeed(matching, {}, sort), [matching, sort]);
+  const { results, running } = useSwarmTests(candidates, true);
+  const listed = useMemo(() => sortBySpeed(matching, results, sort), [matching, results, sort]);
+  const testing = Object.keys(running).length;
+  const tested = listed.filter((stream) => freshResult(results, streamInfoHash(stream))).length;
+  const select = (stream: Stream) => {
+    // Keep the tested torrent (and its peers) for playback.
+    void claimSwarmTest(stream).finally(() => onSelect(stream));
+  };
   useEffect(() => {
     const timer = setTimeout(() => focusSelf(), 30);
     return () => clearTimeout(timer);
@@ -118,6 +158,11 @@ export const SourcePickerDialog: React.FC<{
                   </FocusableButton>
                 ))}
               </div>
+              <div style={{ fontSize: 12, color: "var(--on-surface-variant)", margin: "16px 0 8px" }}>Order</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                <FocusableButton focusKey="SOURCE_SORT_SPEED" style={chip(sort === "speed")} onClick={() => setSort("speed")}>Fastest first</FocusableButton>
+                <FocusableButton focusKey="SOURCE_SORT_QUALITY" style={chip(sort === "quality")} onClick={() => setSort("quality")}>Best quality first</FocusableButton>
+              </div>
               <div style={{ fontSize: 12, color: "var(--on-surface-variant)", margin: "16px 0 8px" }}>Language</div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                 <FocusableButton focusKey="SOURCE_L_ALL" style={chip(!languages.length)} onClick={() => setLanguages([])}>All</FocusableButton>
@@ -131,14 +176,20 @@ export const SourcePickerDialog: React.FC<{
             <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
               <div style={{ fontSize: 12, color: "var(--on-surface-variant)", marginBottom: 8 }}>
                 {listed.length} of {streams.length} sources
+                {testing ? ` · testing speed of ${testing}…` : tested ? ` · ${tested} speed-tested` : ""}
                 {checking ? " · checking which releases have peers…" : hiddenStreams.length ? ` · ${hiddenStreams.length} without peers hidden` : ""}
               </div>
               <div style={{ flex: 1, overflowY: "auto", paddingRight: 4 }}>
-                {listed.map((stream, index) => (
+                {listed.map((stream, index) => {
+                  const hash = streamInfoHash(stream);
+                  const test = describeTest(freshResult(results, hash), Boolean(hash && running[hash]));
+                  // Stable per release, so focus stays on it when the list re-sorts.
+                  const itemKey = hash ? `${hash}_${stream.server}` : `${index}`;
+                  return (
                   <FocusableButton
-                    key={`${stream.server}:${stream.link}:${index}`}
-                    focusKey={`SOURCE_ITEM_${index}`}
-                    onClick={() => onSelect(stream)}
+                    key={itemKey}
+                    focusKey={`SOURCE_ITEM_${itemKey}`}
+                    onClick={() => select(stream)}
                     style={{
                       display: "block",
                       width: "100%",
@@ -161,11 +212,13 @@ export const SourcePickerDialog: React.FC<{
                         {stream.title}
                       </div>
                     )}
+                    {test && <TestResult line={test} />}
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                       {streamBadges(stream).map((badge) => <Badge key={badge} text={badge} />)}
                     </div>
                   </FocusableButton>
-                ))}
+                  );
+                })}
                 {!listed.length && (
                   <div style={{ color: "var(--on-surface-variant)", padding: 12 }}>
                     {streams.length ? "No matching sources. Change the quality or language filters." : "No servers available"}

@@ -54,6 +54,8 @@ const TITLE_LOOKUP_BUDGET_MS = 5000;
 const TOTAL_BUDGET_MS = 14000;
 const SEARCH_CACHE_MS = 10 * 60 * 1000;
 const USER_AGENT = 'Vega/5.3 (Android; torrent search)';
+// Tracker sites serve their search pages to browsers.
+const BROWSER_USER_AGENT = 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Mobile Safari/537.36';
 
 const TRACKER_NAMES: Record<string, string> = {
   rutracker: 'RuTracker',
@@ -529,6 +531,23 @@ const getJson = async (host: string, path: string, params: Record<string, unknow
   }
 };
 
+/** GET an HTML page from an optional source; a failure marks its host. */
+const getText = async (host: string, path: string): Promise<string> => {
+  try {
+    const response = await platformFetch(`${host}${path}`, {
+      headers: {Accept: 'text/html', 'User-Agent': BROWSER_USER_AGENT},
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status} from ${host}`);
+    const html = await response.text();
+    markHost(host, true);
+    return html;
+  } catch (error) {
+    markHost(host, false);
+    throw error;
+  }
+};
+
 const updatedAt = (torrent: JacredTorrent) => Date.parse(torrent.updateTime || torrent.createTime || '') || 0;
 
 /** Releases from every reachable JacRed mirror; the most recently updated record of a release wins. */
@@ -785,6 +804,86 @@ const searchJacredTarget = async (target: TorrentioTarget): Promise<Stream[]> =>
 
 
 
+// Rutor's own search lists live seeders and leechers from its tracker, fresher
+// than any aggregator's snapshot of the same releases.
+export const RUTOR_HOSTS = ['https://rutor.info', 'https://rutor.is'];
+
+export type RutorRow = {title: string; magnet: string; size: string; seeds: number; leechers: number};
+
+const decodeHtml = (text: string) =>
+  text
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .trim();
+
+/** Result rows of a Rutor search page. */
+export const parseRutor = (html: string): RutorRow[] =>
+  html.split(/<tr class="(?:gai|tum)">/).slice(1).flatMap(row => {
+    const magnet = row.match(/href="(magnet:\?xt=urn:btih:[0-9a-fA-F]{40}[^"]*)"/)?.[1];
+    const title = row.match(/<a href="\/torrent\/\d+[^"]*">([^<]+)<\/a>/)?.[1];
+    if (!magnet || !title) return [];
+    return [{
+      title: decodeHtml(title),
+      magnet: decodeHtml(magnet),
+      size: decodeHtml(row.match(/<td align="right">([\d.,]+&nbsp;[KMGT]B)<\/td>/i)?.[1] || ''),
+      seeds: Number(row.match(/class="green"><img[^>]*>(?:&nbsp;|\s)*(\d+)/)?.[1] || 0),
+      leechers: Number(row.match(/class="red">(?:&nbsp;|\s)*(\d+)/)?.[1] || 0),
+    }];
+  });
+
+const searchRutor = (query: string): Promise<RutorRow[]> =>
+  cachedSearch(`rutor:${query.toLowerCase()}`, async () => {
+    let lastError: unknown = new Error('Rutor is unreachable');
+    for (const host of RUTOR_HOSTS.filter(hostUsable)) {
+      try {
+        const html = await getText(host, `/search/0/0/100/0/${encodeURIComponent(query)}`);
+        return parseRutor(html);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError;
+  });
+
+const searchRutorTarget = async (target: TorrentioTarget): Promise<Stream[]> => {
+  const russian = await withDeadline(fetchRussianTitles(target).catch(() => [] as string[]), TITLE_LOOKUP_BUDGET_MS, [] as string[]);
+  const names = titleVariants([...russian, ...(target.title ? [target.title] : [])]);
+  if (!names.length) return [];
+  const {from} = yearRange(target.year);
+  // A movie's year narrows Rutor's word search; series titles carry a range.
+  const queries = [...new Set(names.map(name => (target.type === 'movie' && from ? `${name} ${from}` : name)))];
+  const results = await Promise.allSettled(queries.map(searchRutor));
+  const wanted = names.map(normalizeName).filter(Boolean);
+  const now = new Date().toISOString();
+  const seen = new Set<string>();
+  return fulfilled(results, 'Rutor').flatMap(row => {
+    const hash = torrentHash(row.magnet);
+    if (!hash || seen.has(hash) || !(row.seeds > 0)) return [];
+    // Rutor matches words anywhere; the release must carry one of the titles.
+    // Whole words: "Кит" must not match "Китай".
+    const name = ` ${normalizeName(row.title)} `;
+    if (!wanted.some(title => name.includes(` ${title} `))) return [];
+    const year = Number(row.title.match(/\((\d{4})(?:\s*[-–]\s*\d{4})?\)/)?.[1] || 0);
+    const torrent: JacredTorrent = {
+      tracker: 'rutor',
+      title: row.title,
+      sid: row.seeds,
+      magnet: row.magnet,
+      sizeName: row.size,
+      relased: year,
+      updateTime: now,
+      types: [],
+    };
+    if (!matchesJacred(torrent, target)) return [];
+    seen.add(hash);
+    return [jacredToStream(torrent)];
+  });
+};
+
 const searchWesternTarget = async (target: TorrentioTarget): Promise<Stream[]> => {
   const queries = westernQueries(target);
   const searches = [searchKnaben, searchApibay, searchTorrentsCsv, searchBitsearch]
@@ -803,18 +902,20 @@ const searchWesternTarget = async (target: TorrentioTarget): Promise<Stream[]> =
 };
 
 const searchTarget = async (target: TorrentioTarget): Promise<Stream[]> => {
-  const [jacred, western] = await Promise.all([
+  const [rutor, jacred, western] = await Promise.all([
+    searchRutorTarget(target).catch(() => [] as Stream[]),
     searchJacredTarget(target).catch(() => [] as Stream[]),
     searchWesternTarget(target).catch(() => [] as Stream[]),
   ]);
+  // Rutor's live counts come first, so they win over a stale JacRed copy.
   const seen = new Set<string>();
-  const streams = [...jacred, ...western].filter(stream => {
+  const streams = [...rutor, ...jacred, ...western].filter(stream => {
     const hash = torrentHash(stream.link);
     if (!hash || seen.has(hash)) return false;
     seen.add(hash);
     return true;
   });
-  console.log(`Extra torrent sources for ${target.imdbId}: JacRed ${jacred.length}, international ${western.length}, unique ${streams.length}`);
+  console.log(`Extra torrent sources for ${target.imdbId}: Rutor ${rutor.length}, JacRed ${jacred.length}, international ${western.length}, unique ${streams.length}`);
   return streams;
 };
 

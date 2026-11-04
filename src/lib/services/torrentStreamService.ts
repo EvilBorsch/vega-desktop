@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {isTauriRuntime} from "../../platform/host";
 import { pickVideoFileIndex, type EpisodeTarget } from "../player/episodeFile";
 import { useTorrentStatusStore } from "../zustand/torrentStatusStore";
+import { knownPeers } from "../player/swarmTests";
 
 export function isTorrentUrl(url?: string | null): boolean {
   if (!url) return false;
@@ -88,9 +89,12 @@ async function addTorrent(apiPort: number, torrentUrl: string, signal?: AbortSig
   const abort = () => controller.abort();
   signal?.addEventListener("abort", abort);
   const timer = setTimeout(abort, METADATA_TIMEOUT_MS + 5_000);
+  // Peers a swarm test just talked to: no new search before the first bytes.
+  const peers = knownPeers(torrentUrl);
+  const initialPeers = peers.length ? `&initial_peers=${encodeURIComponent(peers.join(","))}` : "";
   try {
     const res = await fetch(
-      `http://127.0.0.1:${apiPort}/torrents?overwrite=true&timeout_ms=${METADATA_TIMEOUT_MS}`,
+      `http://127.0.0.1:${apiPort}/torrents?overwrite=true&timeout_ms=${METADATA_TIMEOUT_MS}${initialPeers}`,
       { method: "POST", body: torrentUrl, signal: controller.signal },
     );
     if (!res.ok) {

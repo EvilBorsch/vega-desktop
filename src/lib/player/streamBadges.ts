@@ -15,3 +15,12 @@ export function streamBadges(stream: FilterableStream): string[] {
     return true;
   });
 }
+
+/** A badge in words: seeder and peer counts are stored with emoji markers. */
+export function badgeLabel(badge: string): string {
+  const seeders = badge.match(/^(?:👤\s*|S:\s*)(\d+)$/i)?.[1];
+  if (seeders !== undefined) return `${seeders} seeders`;
+  const dht = badge.match(/^👥\s*(\d+)$/)?.[1];
+  if (dht !== undefined) return `~${dht} peers in DHT`;
+  return badge;
+}
