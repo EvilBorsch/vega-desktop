@@ -4,7 +4,7 @@ import {invoke} from '@tauri-apps/api/core';
 import type {Stream} from '../providers/types';
 import {isTauriRuntime} from '../../platform/host';
 import {liveSeeders, streamInfoHash} from './swarmHealth';
-import {streamQuality} from './streamFilters';
+import {streamLanguages, streamQuality} from './streamFilters';
 
 /** What briefly joining a release's swarm showed (Rust `test_swarms`). */
 export type SwarmTestResult = {
@@ -24,7 +24,8 @@ export type SwarmTestResult = {
 
 /** Candidates tested at once; enough to fill the first screen of the list. */
 export const SWARM_TEST_BATCH = 8;
-export const SWARM_TEST_SECONDS = 10;
+// Releases whose torrent info comes late are measured a little longer.
+export const SWARM_TEST_SECONDS = 12;
 // Swarms change slowly; a result stays useful for the next choices, also
 // after the app restarts.
 const RESULT_TTL_MS = 30 * 60 * 1000;
@@ -56,6 +57,8 @@ type SwarmTestState = {
   /** Failed tests per release; one that did not answer is tested once more. */
   failures: Record<string, number>;
   start: (hashes: string[]) => void;
+  /** Forgets the results of these releases, so they are tested again. */
+  recheck: (hashes: string[]) => void;
   finish: (hashes: string[], results: Record<string, Omit<SwarmTestResult, 'testedAt'>>) => void;
 };
 
@@ -64,6 +67,16 @@ export const useSwarmTestStore = create<SwarmTestState>(set => ({
   running: {},
   failures: {},
   start: hashes => set(state => ({running: {...state.running, ...Object.fromEntries(hashes.map(hash => [hash, true as const]))}})),
+  recheck: hashes => set(state => {
+    const results = {...state.results};
+    const failures = {...state.failures};
+    for (const hash of hashes) {
+      delete results[hash];
+      delete failures[hash];
+    }
+    save(results);
+    return {results, failures};
+  }),
   finish: (hashes, results) => set(state => {
     const running = {...state.running};
     for (const hash of hashes) delete running[hash];
@@ -86,6 +99,9 @@ export const freshResult = (results: Record<string, SwarmTestResult>, hash?: str
 
 /** A tested release whose peers did not even send the torrent info. */
 export const testFailed = (result?: SwarmTestResult) => Boolean(result && !result.metadata);
+
+/** Below this a test got next to nothing (bytes per second). */
+export const NO_DATA_SPEED = 16 * 1024;
 
 /** Measured speed that streams HD video without waiting. */
 export const GOOD_SPEED = 300 * 1024;
@@ -148,9 +164,14 @@ export const describeTest = (result?: SwarmTestResult, running = false): TestLin
   if (!result.metadata) {
     return result.peers > 0
       ? {text: `${result.peers} peers connected but sent no torrent info — likely won't play`, tone: 'bad'}
-      : {text: "No peers answered in 10 s — likely won't play", tone: 'bad'};
+      : {text: "No peers answered — likely won't play", tone: 'bad'};
   }
   if (result.peers === 0) return {text: 'Torrent info received, but no peer is sending data yet', tone: 'bad'};
+  // Next to nothing arrived: say so instead of a speed of "1 KB/s".
+  if (Math.max(result.speed, result.maxSpeed * 0.5) < NO_DATA_SPEED) {
+    const seeds = result.seeds >= 0 ? ` (${result.seeds} seeds)` : '';
+    return {text: `No video data in the test · ${result.peers} peers${seeds} connected`, tone: 'bad'};
+  }
   const speed = Math.max(result.speed, result.maxSpeed * 0.5);
   const peers = result.seeds >= 0 ? `${result.peers} peers (${result.seeds} seeds)` : `${result.peers} peers connected`;
   const tone = speed >= 1024 * 1024 ? 'good' : speed >= GOOD_SPEED ? 'ok' : 'bad';
@@ -165,6 +186,38 @@ export const knownPeers = (link: string): string[] => {
     .map(peer => peer.replace(/^[a-z]+:\/\//i, ''))
     .filter(peer => /^[\d.]+:\d+$|^\[[0-9a-f:]+\]:\d+$/i.test(peer))
     .slice(0, 30);
+};
+
+const LANGUAGE_NAMES: Record<string, string> = {RU: 'Russian', EN: 'English'};
+// Below this, the other language is worth a look.
+const SLOW_LANGUAGE_SPEED = 1024 * 1024;
+
+/**
+ * When the releases shown in Russian (or English) all measured slow and the
+ * other language has releases, which language to offer instead. A small
+ * Russian swarm can be several times slower than the English one of the
+ * same episode.
+ */
+export const slowLanguageHint = (
+  listed: Stream[],
+  all: Stream[],
+  results: Record<string, SwarmTestResult>,
+  languages: string[],
+): {language: string; text: string} | undefined => {
+  const current = languages.length === 1 ? languages[0] : undefined;
+  if (!current || !LANGUAGE_NAMES[current]) return undefined;
+  const other = current === 'RU' ? 'EN' : 'RU';
+  if (!all.some(stream => stream.type === 'torrent' && streamLanguages(stream).includes(other))) return undefined;
+  const measured = listed
+    .filter(stream => stream.type === 'torrent')
+    .map(stream => freshResult(results, streamInfoHash(stream)))
+    .filter((result): result is SwarmTestResult => Boolean(result));
+  const torrents = listed.filter(stream => stream.type === 'torrent').length;
+  if (!measured.length || measured.length < Math.min(3, torrents)) return undefined;
+  const best = Math.max(0, ...measured.map(result => (testFailed(result) ? 0 : Math.max(result.speed, result.maxSpeed * 0.5))));
+  if (best >= SLOW_LANGUAGE_SPEED) return undefined;
+  const fastest = best >= NO_DATA_SPEED ? ` (fastest ${formatSpeed(best)})` : '';
+  return {language: other, text: `${LANGUAGE_NAMES[current]} releases are slow here${fastest}. ${LANGUAGE_NAMES[other]} ones may be faster.`};
 };
 
 /** How far the speed check of a list has come. */

@@ -37,15 +37,34 @@ export const getStreamFilterOptions = (streams: FilterableStream[]) => ({
     return order.indexOf(a) - order.indexOf(b);
   }),
 });
+// Releases the default filter keeps at least, so one slow release at the top
+// quality does not leave nothing else to pick.
+const DEFAULT_FILTER_MIN_RELEASES = 4;
+
 /**
  * What a source list opens with: Russian audio, or English when no release has
- * Russian, and the best quality among the releases in that language.
+ * Russian, and the best qualities in that language: the top one, plus the next
+ * ones down until there are a few releases to choose from.
  */
-export const defaultStreamFilters = (streams: FilterableStream[]): {qualities: string[]; languages: string[]} => {
-  const language = ['RU', 'EN'].find(code => streams.some(stream => streamLanguages(stream).includes(code)));
+export const defaultStreamFilters = (
+  streams: FilterableStream[],
+  preferred: readonly string[] = ['RU', 'EN'],
+): {qualities: string[]; languages: string[]} => {
+  const language = preferred.find(code => streams.some(stream => streamLanguages(stream).includes(code)));
   const pool = language ? streams.filter(stream => streamLanguages(stream).includes(language)) : streams;
-  const best = Math.max(0, ...pool.map(stream => Number(streamQuality(stream)) || 0));
-  return {languages: language ? [language] : [], qualities: best ? [String(best)] : []};
+  const counts = new Map<number, number>();
+  for (const stream of pool) {
+    const quality = Number(streamQuality(stream)) || 0;
+    if (quality) counts.set(quality, (counts.get(quality) || 0) + 1);
+  }
+  const qualities: string[] = [];
+  let listed = 0;
+  for (const quality of [...counts.keys()].sort((a, b) => b - a)) {
+    qualities.push(String(quality));
+    listed += counts.get(quality)!;
+    if (listed >= DEFAULT_FILTER_MIN_RELEASES) break;
+  }
+  return {languages: language ? [language] : [], qualities};
 };
 
 export const filterStreams = <T extends FilterableStream>(streams: T[], qualities: string[], selectedLanguages: string[]): T[] =>

@@ -10,8 +10,10 @@ import {
   describeProgress,
   describeTest,
   freshResult,
+  slowLanguageHint,
   sortBySpeed,
   testProgress,
+  useSwarmTestStore,
   useSwarmTests,
   type SourceSort,
   type TestLine,
@@ -105,6 +107,10 @@ export const SourcePickerDialog: React.FC<{
   const listed = useMemo(() => sortBySpeed(matching, results, sort), [matching, results, sort]);
   const progress = testProgress(listed, results, running);
   const progressText = describeProgress(progress);
+  const hint = progress.testing ? undefined : slowLanguageHint(listed, streams, results, languages);
+  // Swarms change: measure the listed releases again.
+  const recheck = () =>
+    useSwarmTestStore.getState().recheck(listed.map(streamInfoHash).filter((hash): hash is string => Boolean(hash)));
   const select = (stream: Stream) => {
     // Keep the tested torrent (and its peers) for playback.
     void claimSwarmTest(stream).finally(() => onSelect(stream));
@@ -186,10 +192,25 @@ export const SourcePickerDialog: React.FC<{
               </div>
               {progressText && (
                 <div style={{ marginBottom: 10 }} aria-label={progressText}>
-                  <div style={{ fontSize: 12, color: "var(--on-surface-variant)" }}>{progressText}</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <div style={{ fontSize: 12, color: "var(--on-surface-variant)", flex: 1 }}>{progressText}</div>
+                    {!progress.testing && (
+                      <FocusableButton focusKey="SOURCE_RECHECK" aria-label="Check the speed of these releases again" onClick={recheck} style={chip(false)}>
+                        ↻ Recheck
+                      </FocusableButton>
+                    )}
+                  </div>
                   <div style={{ height: 4, borderRadius: 2, marginTop: 4, background: "var(--surface-container-highest)", overflow: "hidden" }}>
                     <div style={{ height: 4, width: `${Math.round((100 * progress.tested) / progress.total)}%`, background: "var(--primary)", transition: "width 300ms" }} />
                   </div>
+                </div>
+              )}
+              {hint && (
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10, padding: 10, borderRadius: 12, background: "var(--surface-container-high)" }}>
+                  <span style={{ flex: 1, fontSize: 13 }}>🐢 {hint.text}</span>
+                  <FocusableButton focusKey="SOURCE_LANGUAGE_HINT" style={chip(true)} onClick={() => setChosen(defaultStreamFilters(streams, [hint.language]))}>
+                    {hint.language === "EN" ? "Show English" : "Show Russian"}
+                  </FocusableButton>
                 </div>
               )}
               <div style={{ flex: 1, overflowY: "auto", paddingRight: 4 }}>

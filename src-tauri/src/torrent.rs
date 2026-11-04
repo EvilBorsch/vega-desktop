@@ -53,6 +53,10 @@ const TEST_BYTES: u64 = 12 * 1024 * 1024;
 const TEST_POLL: Duration = Duration::from_millis(500);
 /// Speed samples averaged for the result: the last three seconds.
 const TEST_SPEED_SAMPLES: usize = 6;
+/// Time after the torrent info a test keeps measuring, and how far past its
+/// budget it may go for releases whose info came late.
+const TEST_MIN_DATA_WINDOW: Duration = Duration::from_secs(8);
+const TEST_EXTRA_WINDOW: Duration = Duration::from_secs(12);
 /// Peer addresses kept, to hand playback the peers that answered.
 const TEST_PEER_LIST: usize = 40;
 
@@ -230,7 +234,7 @@ async fn test_swarm(
 ) -> SwarmTestResult {
     let hash = id.as_string();
     let started = Instant::now();
-    let deadline = started + budget;
+    let hard_deadline = started + budget + TEST_EXTRA_WINDOW;
     let mut result = SwarmTestResult {
         seeds: -1,
         ..Default::default()
@@ -245,7 +249,7 @@ async fn test_swarm(
         }),
     );
     let added = match futures_util::future::select(
-        Box::pin(tokio::time::timeout(budget, add)),
+        Box::pin(tokio::time::timeout(budget + TEST_EXTRA_WINDOW, add)),
         Box::pin(wait_cancelled(&tests, generation)),
     )
     .await
@@ -280,6 +284,8 @@ async fn test_swarm(
         }
     }
     let metadata_at = Instant::now();
+    // A release whose info came late still gets a few seconds of data.
+    let deadline = (started + budget).max(metadata_at + TEST_MIN_DATA_WINDOW).min(hard_deadline);
     // Bytes peers sent in this test. `progress_bytes` is no measure: it jumps
     // when the file selection changes.
     let mut start_bytes: Option<u64> = if owned { Some(0) } else { None };

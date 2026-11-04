@@ -219,6 +219,12 @@ export const seasonsInTitle = (title: string): number[] => {
 // "(28 из 28)" counts episodes, so that form only names episodes as a range.
 const EPISODE_RANGES = [
   /сери[яи][:\s]*(\d{1,4})(?:\s*[-–—]\s*(\d{1,4}))?\s*из\s*\d+/i,
+  // "Сезон 1, серия 5", "серии 5-8" without a total.
+  /сери[яи][:\s]+(\d{1,4})(?:\s*[-–—]\s*(\d{1,4}))?/i,
+  // LostFilm and Kinozal: "3 сезон 8 серия", "(1 сезон: 1-10 серии)".
+  /\d\s*сезон[:,\s]+(\d{1,4})(?:\s*[-–—]\s*(\d{1,4}))?\s*сери[яийю]/i,
+  // Ultradox: "(3 сезон) [+10 серия]" holds the season up to episode 10.
+  /\[\+\s*(?:1\s*[-–—]\s*)?(\d{1,4})\s*сери[яий]\]/i,
   /\[\d{1,2}x(\d{1,4})(?:\s*[-–—]\s*(\d{1,4}))?\s*из\s*\d+\]/i,
   /\[(\d{1,4})\s*[-–—]\s*(\d{1,4})\s*из\s*\d+\]/i,
   /\((\d{1,4})\s*[-–—]\s*(\d{1,4})\s*из\s*\d+\)/i,
@@ -232,8 +238,10 @@ const containsEpisode = (title: string, episode: number): boolean => {
   for (const pattern of EPISODE_RANGES) {
     const match = title.match(pattern);
     if (!match) continue;
-    const from = Number(match[1]);
-    const to = match[2] ? Number(match[2]) : from;
+    // "[+10 серия]" counts episodes so far: 1 to 10.
+    const cumulative = match[0].startsWith('[+');
+    const from = cumulative ? 1 : Number(match[1]);
+    const to = cumulative ? Number(match[1]) : match[2] ? Number(match[2]) : from;
     return episode >= from && episode <= to;
   }
   return true;
