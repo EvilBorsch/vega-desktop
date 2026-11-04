@@ -118,6 +118,46 @@ export class ExtensionManager {
     }
   }
 
+  private defaultProvidersTask?: Promise<void>;
+
+  /**
+   * The fork works out of the box: the Zenda-Cross provider source is added
+   * and Torrentio (which carries the Russian and international torrent
+   * sources) is installed once. Removing them later is the user's choice.
+   */
+  ensureDefaultProviders(): Promise<void> {
+    const key = "forkDefaultProviders:v1";
+    if (mainStorage.getBool(key)) return Promise.resolve();
+    if (this.defaultProvidersTask) return this.defaultProvidersTask;
+    this.defaultProvidersTask = (async () => {
+      this.migrateLegacyCustomProviderSource();
+      let source = extensionStorage
+        .getProviderSources()
+        .find((item) => item.author === "Zenda-Cross");
+      if (!source) {
+        source = createProviderSource("Zenda-Cross");
+        extensionStorage.addProviderSources(source.author, source.url, source.manifestUrl);
+        if (extensionStorage.getProviderSources().length === 1) {
+          extensionStorage.setDefaultProviderSource(source.author);
+        }
+      }
+      const author = source.author;
+      const installed = extensionStorage
+        .getInstalledProviders()
+        .some((provider) => provider.value === "torrentio" && provider.source?.author === author);
+      if (!installed) {
+        const manifest = await this.fetchManifest(source, true);
+        const provider = manifest.find((item) => item.value === "torrentio" && !item.disabled);
+        if (!provider) throw new Error("Torrentio is unavailable in the default provider source");
+        await this.installProvider(provider);
+      }
+      mainStorage.setBool(key, true);
+    })().finally(() => {
+      this.defaultProvidersTask = undefined;
+    });
+    return this.defaultProvidersTask;
+  }
+
   // Test mode configuration
   private testModuleCache = new Map<
     string,
