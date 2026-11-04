@@ -37,6 +37,17 @@ export const getStreamFilterOptions = (streams: FilterableStream[]) => ({
     return order.indexOf(a) - order.indexOf(b);
   }),
 });
+/**
+ * What a source list opens with: Russian audio, or English when no release has
+ * Russian, and the best quality among the releases in that language.
+ */
+export const defaultStreamFilters = (streams: FilterableStream[]): {qualities: string[]; languages: string[]} => {
+  const language = ['RU', 'EN'].find(code => streams.some(stream => streamLanguages(stream).includes(code)));
+  const pool = language ? streams.filter(stream => streamLanguages(stream).includes(language)) : streams;
+  const best = Math.max(0, ...pool.map(stream => Number(streamQuality(stream)) || 0));
+  return {languages: language ? [language] : [], qualities: best ? [String(best)] : []};
+};
+
 export const filterStreams = <T extends FilterableStream>(streams: T[], qualities: string[], selectedLanguages: string[]): T[] =>
   streams.filter(stream => (!qualities.length || qualities.includes(streamQuality(stream))) &&
     (!selectedLanguages.length || streamLanguages(stream).some(language => selectedLanguages.includes(language))));

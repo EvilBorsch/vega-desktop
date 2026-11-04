@@ -22,5 +22,7 @@ export function badgeLabel(badge: string): string {
   if (seeders !== undefined) return `${seeders} seeders`;
   const dht = badge.match(/^👥\s*(\d+)$/)?.[1];
   if (dht !== undefined) return `~${dht} peers in DHT`;
+  const leechers = badge.match(/^⬇\s*(\d+)$/)?.[1];
+  if (leechers !== undefined) return `${leechers} leechers`;
   return badge;
 }

@@ -20,7 +20,7 @@ const requestJson = async (
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
-  if (!response.ok) throw new Error(`HTTP ${response.status} from ${target.host}`);
+  if (!response.ok) throw Object.assign(new Error(`HTTP ${response.status} from ${target.host}`), {status: response.status});
   return response.json();
 };
 
@@ -49,7 +49,12 @@ export const KNABEN_API = 'https://api.knaben.org/v1';
 
 const REQUEST_TIMEOUT_MS = 7000;
 const HOST_RETRY_MS = 30 * 60 * 1000;
-const MIRROR_GRACE_MS = 2500;
+// Requests to one host are made one at a time, so a mirror answering a
+// second query can need a few seconds more than the first one.
+const MIRROR_GRACE_MS = 5000;
+// JacRed answers a second concurrent request from one client with HTTP 429.
+const RATE_LIMIT_RETRIES = 2;
+const RATE_LIMIT_BACKOFF_MS = 1200;
 const TITLE_LOOKUP_BUDGET_MS = 5000;
 const TOTAL_BUDGET_MS = 14000;
 const SEARCH_CACHE_MS = 10 * 60 * 1000;
@@ -88,6 +93,8 @@ export type JacredTorrent = {
   size?: number;
   sizeName?: string;
   sid?: number;
+  /** Leechers (JacRed calls them peers). */
+  pir?: number;
   magnet?: string;
   relased?: number;
   createTime?: string;
@@ -97,6 +104,10 @@ export type JacredTorrent = {
   voices?: string[];
   seasons?: number[];
   types?: string[];
+  /** Every tracker that lists this release (the same info hash), best first. */
+  trackers?: string[];
+  /** Audio languages a JacRed probe of the files found ("rus", "eng"). */
+  languages?: string[];
 };
 
 /** A release from an international index, named in Western style. */
@@ -105,6 +116,7 @@ export type WesternHit = {
   hash: string;
   magnet?: string;
   seeders: number;
+  leechers?: number;
   bytes?: number;
   /** The index it came from, shown as the server. */
   source: string;
@@ -365,24 +377,28 @@ const voiceTag = (voices?: string[]): string => {
   return names.length > 3 ? `${names.slice(0, 3).join(', ')} +${names.length - 3}` : names.join(', ');
 };
 
-const releaseStream = ({server, title, magnet, quality, seeders, seedersAsOf, languages, extra = [], size}: {
+const releaseStream = ({server, title, magnet, quality, seeders, leechers = 0, seedersAsOf, languages, extra = [], size}: {
   server: string;
   title: string;
   magnet: string;
   quality: string;
   seeders: number;
+  leechers?: number;
   /** When the count is an old snapshot rather than a live one. */
   seedersAsOf?: Date;
   languages: string[];
   extra?: string[];
   size: string;
 }): Stream => {
-  const seedersTag = seedersAsOf
-    ? `≈${Math.max(0, seeders)} seeders (${String(seedersAsOf.getUTCMonth() + 1).padStart(2, '0')}.${seedersAsOf.getUTCFullYear()})`
-    : `👤${Math.max(0, seeders)}`;
+  const asOf = seedersAsOf
+    ? ` (${String(seedersAsOf.getUTCMonth() + 1).padStart(2, '0')}.${seedersAsOf.getUTCFullYear()})`
+    : '';
+  const swarmTags = seedersAsOf
+    ? [`≈${Math.max(0, seeders)} seeders${leechers > 0 ? `, ${leechers} leechers` : ''}${asOf}`]
+    : [`👤${Math.max(0, seeders)}`, leechers > 0 ? `⬇${leechers}` : ''];
   const tags = [
     quality ? `${quality}p` : '',
-    seedersTag,
+    ...swarmTags,
     ...formatTags(title),
     ...languages,
     ...extra,
@@ -407,21 +423,36 @@ const staleSince = (torrent: JacredTorrent, now: number): Date | undefined => {
   return Number.isFinite(updated) && now - updated > STALE_SEEDERS_MS ? new Date(updated) : undefined;
 };
 
+const trackerName = (tracker: string) =>
+  TRACKER_NAMES[tracker] || tracker.charAt(0).toUpperCase() + tracker.slice(1);
+
+/** "RuTracker · Kinozal · BitRu", at most three names. */
+export const serverLabel = (names: string[]): string => {
+  const unique = [...new Set(names.filter(Boolean))];
+  return unique.length > 3 ? `${unique.slice(0, 3).join(' · ')} +${unique.length - 3}` : unique.join(' · ');
+};
+
+const PROBED_LANGUAGES: Record<string, string> = {rus: 'RU', eng: 'EN', ukr: 'UA', jpn: 'JA', kor: 'KO', fre: 'FR', fra: 'FR', ger: 'DE', deu: 'DE', spa: 'ES', ita: 'IT', por: 'PT', chi: 'ZH', zho: 'ZH', hin: 'HI'};
+
 export const jacredToStream = (torrent: JacredTorrent, now = Date.now()): Stream => {
   const international = INTERNATIONAL_TRACKERS.has(torrent.tracker);
   // Knaben mirrors end their names with the index they came from: "... | The Pirate Bay".
   const origin = international ? torrent.title.match(/\s+\|\s*([^|]+)$/)?.[1]?.trim() : undefined;
   const title = origin ? torrent.title.slice(0, torrent.title.lastIndexOf('|')).trim() : torrent.title;
+  const probed = [...new Set((torrent.languages || []).map(code => PROBED_LANGUAGES[code]).filter(Boolean))];
   return releaseStream({
-    server: origin || TRACKER_NAMES[torrent.tracker] || torrent.tracker.charAt(0).toUpperCase() + torrent.tracker.slice(1),
+    server: origin || serverLabel((torrent.trackers?.length ? torrent.trackers : [torrent.tracker]).map(trackerName)),
     title,
     magnet: torrent.magnet!,
     quality: jacredQuality(torrent),
     seeders: torrent.sid || 0,
+    leechers: torrent.pir || 0,
     seedersAsOf: staleSince(torrent, now),
-    languages: international
-      ? releaseLanguages(title, origin || '')
-      : torrent.tracker === 'toloka' ? ['UA'] : ['RU'],
+    languages: probed.length
+      ? probed
+      : international
+        ? releaseLanguages(title, origin || '')
+        : torrent.tracker === 'toloka' ? ['UA'] : ['RU'],
     extra: [voiceTag(torrent.voices)],
     size: formatSize(torrent.size, torrent.sizeName),
   });
@@ -439,6 +470,7 @@ export const westernToStream = (hit: WesternHit, now = Date.now()): Stream => {
       : `magnet:?xt=urn:btih:${hash}&dn=${encodeURIComponent(title)}`,
     quality: qualityFromTitle(title),
     seeders: hit.seeders,
+    leechers: hit.leechers,
     seedersAsOf: checked,
     languages: releaseLanguages(title, hit.source),
     size: formatSize(hit.bytes),
@@ -519,36 +551,87 @@ const markHost = (host: string, ok: boolean) => {
   else hostSkipUntil.set(host, Date.now() + HOST_RETRY_MS);
 };
 
-/** GET a JSON document from an optional source; a failure marks its host. */
-const getJson = async (host: string, path: string, params: Record<string, unknown>): Promise<any> => {
+const hostQueues = new Map<string, Promise<unknown>>();
+
+/**
+ * Runs requests to one host one after another. JacRed answers a second
+ * concurrent request with HTTP 429, and a refused query lost its releases.
+ */
+const queued = <T>(host: string, request: () => Promise<T>): Promise<T> => {
+  const run = (hostQueues.get(host) || Promise.resolve()).catch(() => {}).then(request);
+  hostQueues.set(host, run.catch(() => {}));
+  return run;
+};
+
+const httpStatus = (error: any): number | undefined => error?.response?.status ?? error?.status;
+
+/** A request to an optional source: queued per host, retried when rate limited. */
+const requestFromHost = async <T>(host: string, request: () => Promise<T>): Promise<T> => {
   try {
-    const data = await requestJson(`${host}${path}`, {params});
+    const result = await queued(host, async () => {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return await request();
+        } catch (error) {
+          if (httpStatus(error) !== 429 || attempt >= RATE_LIMIT_RETRIES) throw error;
+          await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_BACKOFF_MS * (attempt + 1)));
+        }
+      }
+    });
     markHost(host, true);
-    return data;
+    return result;
   } catch (error) {
-    markHost(host, false);
+    // A busy host is not a broken one.
+    if (httpStatus(error) !== 429) markHost(host, false);
     throw error;
   }
 };
 
+/** GET a JSON document from an optional source; a failure marks its host. */
+const getJson = (host: string, path: string, params: Record<string, unknown>): Promise<any> =>
+  requestFromHost(host, () => requestJson(`${host}${path}`, {params}));
+
 /** GET an HTML page from an optional source; a failure marks its host. */
-const getText = async (host: string, path: string): Promise<string> => {
-  try {
+const getText = (host: string, path: string): Promise<string> =>
+  requestFromHost(host, async () => {
     const response = await platformFetch(`${host}${path}`, {
       headers: {Accept: 'text/html', 'User-Agent': BROWSER_USER_AGENT},
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status} from ${host}`);
-    const html = await response.text();
-    markHost(host, true);
-    return html;
-  } catch (error) {
-    markHost(host, false);
-    throw error;
-  }
-};
+    if (!response.ok) throw Object.assign(new Error(`HTTP ${response.status} from ${host}`), {status: response.status});
+    return response.text();
+  });
 
 const updatedAt = (torrent: JacredTorrent) => Date.parse(torrent.updateTime || torrent.createTime || '') || 0;
+
+/**
+ * One record per release. The same torrent is often posted on several
+ * trackers (RuTracker 14 seeders, Kinozal 3, BitRu 1); each counts only its
+ * own peers, so the highest count stands for the swarm and every tracker is
+ * named. Probed languages and release details come from any record.
+ */
+export const mergeJacred = (torrents: JacredTorrent[]): JacredTorrent[] => {
+  const groups = new Map<string, JacredTorrent[]>();
+  for (const torrent of torrents) {
+    const hash = torrentHash(torrent.magnet) || `${torrent.tracker}:${torrent.title}`;
+    groups.set(hash, [...(groups.get(hash) || []), torrent]);
+  }
+  return [...groups.values()].map(group => {
+    const ranked = [...group].sort((a, b) => (b.sid || 0) - (a.sid || 0) || updatedAt(b) - updatedAt(a));
+    const best = ranked[0];
+    const trackers = [...new Set(ranked.flatMap(torrent => torrent.trackers?.length ? torrent.trackers : [torrent.tracker]))];
+    const detailed = ranked.find(torrent => torrent.relased) || best;
+    return {
+      ...best,
+      relased: best.relased || detailed.relased,
+      types: best.types?.length ? best.types : detailed.types,
+      seasons: best.seasons?.length ? best.seasons : detailed.seasons,
+      pir: Math.max(...group.map(torrent => torrent.pir || 0)),
+      trackers,
+      languages: ranked.find(torrent => torrent.languages?.length)?.languages,
+    };
+  });
+};
 
 /** Releases from every reachable JacRed mirror; the most recently updated record of a release wins. */
 const searchJacred = (query: string): Promise<JacredTorrent[]> =>
@@ -583,14 +666,68 @@ const searchJacred = (query: string): Promise<JacredTorrent[]> =>
       }
     });
     if (!answers.length) throw lastError;
-    const byHash = new Map<string, JacredTorrent>();
-    for (const torrent of answers.flat()) {
-      const hash = torrentHash(torrent.magnet) || `${torrent.tracker}:${torrent.title}`;
-      const known = byHash.get(hash);
-      if (!known || updatedAt(torrent) > updatedAt(known)) byHash.set(hash, torrent);
-    }
-    return [...byHash.values()];
+    return mergeJacred(answers.flat());
   });
+
+// JacRed mirrors that also answer the Jackett API Lampa uses.
+export const JACRED_JACKETT_HOSTS = ['https://jac.red', 'https://jacred.su'];
+
+/** A result of JacRed's Jackett API (what Lampa queries). */
+export const jackettToJacred = (result: any): JacredTorrent | undefined => {
+  const magnet = String(result?.MagnetUri || '');
+  if (!magnet.startsWith('magnet:')) return undefined;
+  const trackers = String(result.Tracker || '').split(',').map(name => name.trim().toLowerCase()).filter(Boolean);
+  const info = result.info || {};
+  return {
+    tracker: trackers[0] || 'jacred',
+    trackers,
+    title: String(result.Title || ''),
+    size: Number(result.Size) || undefined,
+    sizeName: info.sizeName,
+    sid: Number(result.Seeders) || 0,
+    pir: Number(result.Peers) || 0,
+    magnet,
+    relased: Number(info.relased) || undefined,
+    // No refresh time is given; the publish date keeps a count from passing as live.
+    updateTime: result.PublishDate,
+    videotype: info.videotype,
+    quality: Number(info.quality) || undefined,
+    voices: Array.isArray(info.voices) ? info.voices : undefined,
+    seasons: Array.isArray(info.seasons) ? info.seasons : undefined,
+    types: Array.isArray(info.types) ? info.types : undefined,
+    languages: Array.isArray(result.languages) ? result.languages : undefined,
+  };
+};
+
+/**
+ * Lampa's query: the Russian and the original title, year and kind at once,
+ * matched by the mirror itself. It finds releases named in ways a title
+ * search misses.
+ */
+const searchJacredJackett = (target: TorrentioTarget, russian?: string): Promise<JacredTorrent[]> => {
+  const original = target.title || '';
+  const title = russian || original;
+  if (!title) return Promise.resolve([]);
+  const {from} = yearRange(target.year);
+  const params: Record<string, unknown> = {
+    apikey: '',
+    Query: title,
+    title,
+    title_original: original,
+    year: from || undefined,
+    is_serial: target.type === 'movie' ? 1 : 2,
+    'Category[]': target.type === 'movie' ? 2000 : 5000,
+  };
+  return cachedSearch(`jackett:${target.imdbId}:${title.toLowerCase()}`, async () => {
+    const hosts = JACRED_JACKETT_HOSTS.filter(hostUsable);
+    const answers = await Promise.allSettled(hosts.map(host =>
+      getJson(host, '/api/v2.0/indexers/all/results', {...params, ...(JACRED_KEYS[host] ? {apikey: JACRED_KEYS[host]} : {})})));
+    const results = answers.flatMap(answer =>
+      answer.status === 'fulfilled' && Array.isArray(answer.value?.Results) ? answer.value.Results : []);
+    if (!results.length && answers.every(answer => answer.status === 'rejected')) throw new Error('JacRed Jackett API unreachable');
+    return mergeJacred(results.map(jackettToJacred).filter((torrent): torrent is JacredTorrent => Boolean(torrent)));
+  });
+};
 
 const searchKnaben = (query: string): Promise<WesternHit[]> =>
   cachedSearch(`knaben:${query.toLowerCase()}`, async () => {
@@ -611,6 +748,7 @@ const searchKnaben = (query: string): Promise<WesternHit[]> =>
       hash: String(hit.hash || torrentHash(hit.magnetUrl || '')),
       magnet: hit.magnetUrl || undefined,
       seeders: Number(hit.liveSeeders ?? hit.seeders ?? 0),
+      leechers: Number(hit.livePeers ?? hit.peers ?? hit.leechers ?? 0) || undefined,
       bytes: Number(hit.bytes) || undefined,
       source: String(hit.tracker || 'Knaben'),
     }));
@@ -627,6 +765,7 @@ const searchApibay = (query: string): Promise<WesternHit[]> =>
         title: String(item.name || ''),
         hash: String(item.info_hash),
         seeders: Number(item.seeders) || 0,
+        leechers: Number(item.leechers) || undefined,
         bytes: Number(item.size) || undefined,
         source: 'The Pirate Bay',
       }));
@@ -641,6 +780,7 @@ const searchTorrentsCsv = (query: string): Promise<WesternHit[]> =>
       title: String(item.name || ''),
       hash: String(item.infohash || ''),
       seeders: Number(item.seeders) || 0,
+      leechers: Number(item.leechers) || undefined,
       bytes: Number(item.size_bytes) || undefined,
       source: 'Torrents-CSV',
       checkedAt: Number(item.scraped_date) ? Number(item.scraped_date) * 1000 : undefined,
@@ -657,6 +797,7 @@ const searchBitsearch = (query: string): Promise<WesternHit[]> =>
       title: String(item.title || item.name || ''),
       hash: String(item.infohash || ''),
       seeders: Number(item.seeders) || 0,
+      leechers: Number(item.leechers) || undefined,
       bytes: Number(item.size) || undefined,
       source: 'BitSearch',
       checkedAt: Date.parse(item.updatedAt || '') || undefined,
@@ -679,6 +820,7 @@ const searchEztv = (imdbId: string): Promise<WesternHit[]> =>
       hash: String(item.hash || ''),
       magnet: item.magnet_url || undefined,
       seeders: Number(item.seeds) || 0,
+      leechers: Number(item.peers) || undefined,
       bytes: Number(item.size_bytes) || undefined,
       source: 'EZTV',
     }));
@@ -796,8 +938,12 @@ const searchJacredTarget = async (target: TorrentioTarget): Promise<Stream[]> =>
     TITLE_LOOKUP_BUDGET_MS,
     [] as string[],
   )).filter(title => !original.some(known => known.toLowerCase() === title.toLowerCase()));
-  const results = await Promise.allSettled([...russian.map(searchJacred), ...searches]);
-  return fulfilled(results, 'JacRed')
+  const results = await Promise.allSettled([
+    searchJacredJackett(target, russian[0]),
+    ...russian.map(searchJacred),
+    ...searches,
+  ]);
+  return mergeJacred(fulfilled(results, 'JacRed'))
     .filter(torrent => matchesJacred(torrent, target))
     .map(torrent => jacredToStream(torrent));
 };
@@ -872,6 +1018,7 @@ const searchRutorTarget = async (target: TorrentioTarget): Promise<Stream[]> => 
       tracker: 'rutor',
       title: row.title,
       sid: row.seeds,
+      pir: row.leechers,
       magnet: row.magnet,
       sizeName: row.size,
       relased: year,
@@ -901,20 +1048,38 @@ const searchWesternTarget = async (target: TorrentioTarget): Promise<Stream[]> =
   return [...byHash.values()].map(hit => westernToStream(hit));
 };
 
+// A live count outweighs an old snapshot of the same size.
+const swarmWeight = (stream: Stream): number => {
+  const text = [...(stream.tags || []), stream.tag || ''].join(' ');
+  const live = text.match(/👤\s*(\d+)/)?.[1];
+  if (live !== undefined) return Number(live) * 4 + 1;
+  return Number(text.match(/≈(\d+) seeders/)?.[1] || 0);
+};
+
+/**
+ * One entry per info hash: the record with the strongest swarm count, named
+ * after every source that lists the release.
+ */
+export const mergeByHash = (streams: Stream[]): Stream[] => {
+  const groups = new Map<string, Stream[]>();
+  for (const stream of streams) {
+    const hash = torrentHash(stream.link);
+    if (hash) groups.set(hash, [...(groups.get(hash) || []), stream]);
+  }
+  return [...groups.values()].map(group => {
+    const best = group.reduce((a, b) => (swarmWeight(b) > swarmWeight(a) ? b : a));
+    const names = [best, ...group.filter(stream => stream !== best)].flatMap(stream => stream.server.split(' · '));
+    return group.length > 1 ? {...best, server: serverLabel(names)} : best;
+  });
+};
+
 const searchTarget = async (target: TorrentioTarget): Promise<Stream[]> => {
   const [rutor, jacred, western] = await Promise.all([
     searchRutorTarget(target).catch(() => [] as Stream[]),
     searchJacredTarget(target).catch(() => [] as Stream[]),
     searchWesternTarget(target).catch(() => [] as Stream[]),
   ]);
-  // Rutor's live counts come first, so they win over a stale JacRed copy.
-  const seen = new Set<string>();
-  const streams = [...rutor, ...jacred, ...western].filter(stream => {
-    const hash = torrentHash(stream.link);
-    if (!hash || seen.has(hash)) return false;
-    seen.add(hash);
-    return true;
-  });
+  const streams = mergeByHash([...rutor, ...jacred, ...western]);
   console.log(`Extra torrent sources for ${target.imdbId}: Rutor ${rutor.length}, JacRed ${jacred.length}, international ${western.length}, unique ${streams.length}`);
   return streams;
 };

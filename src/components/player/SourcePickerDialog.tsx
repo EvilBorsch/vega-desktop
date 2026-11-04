@@ -2,14 +2,16 @@ import React, { useEffect, useMemo, useState } from "react";
 import { useFocusable, FocusContext } from "@noriginmedia/norigin-spatial-navigation-react";
 import { LuArrowLeft as ArrowLeft, LuPlay as Play } from "react-icons/lu";
 import type { Stream } from "../../lib/providers/types";
-import { filterStreams, getStreamFilterOptions } from "../../lib/player/streamFilters";
+import { defaultStreamFilters, filterStreams, getStreamFilterOptions } from "../../lib/player/streamFilters";
 import { badgeLabel, streamBadges } from "../../lib/player/streamBadges";
 import { streamInfoHash } from "../../lib/player/swarmHealth";
 import {
   claimSwarmTest,
+  describeProgress,
   describeTest,
   freshResult,
   sortBySpeed,
+  testProgress,
   useSwarmTests,
   type SourceSort,
   type TestLine,
@@ -84,8 +86,12 @@ export const SourcePickerDialog: React.FC<{
   onBack: () => void;
 }> = ({ streams, hiddenStreams = [], checking = false, subtitle, onSelect, onBack }) => {
   const { ref, focusKey, focusSelf } = useFocusable({ isFocusBoundary: true, trackChildren: true, focusKey: "SOURCE_PICKER" });
-  const [qualities, setQualities] = useState<string[]>([]);
-  const [languages, setLanguages] = useState<string[]>([]);
+  // Russian (else English) at the best quality until the viewer picks filters.
+  const [chosen, setChosen] = useState<{ qualities: string[]; languages: string[] } | undefined>();
+  const defaults = useMemo(() => defaultStreamFilters(streams), [streams]);
+  const { qualities, languages } = chosen || defaults;
+  const setQualities = (next: string[]) => setChosen({ qualities: next, languages });
+  const setLanguages = (next: string[]) => setChosen({ qualities, languages: next });
   const [showHidden, setShowHidden] = useState(false);
   const [sort, setSort] = useState<SourceSort>("speed");
   const options = useMemo(() => getStreamFilterOptions(streams), [streams]);
@@ -97,8 +103,8 @@ export const SourcePickerDialog: React.FC<{
   const candidates = useMemo(() => sortBySpeed(matching, {}, sort), [matching, sort]);
   const { results, running } = useSwarmTests(candidates, true);
   const listed = useMemo(() => sortBySpeed(matching, results, sort), [matching, results, sort]);
-  const testing = Object.keys(running).length;
-  const tested = listed.filter((stream) => freshResult(results, streamInfoHash(stream))).length;
+  const progress = testProgress(listed, results, running);
+  const progressText = describeProgress(progress);
   const select = (stream: Stream) => {
     // Keep the tested torrent (and its peers) for playback.
     void claimSwarmTest(stream).finally(() => onSelect(stream));
@@ -176,9 +182,16 @@ export const SourcePickerDialog: React.FC<{
             <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
               <div style={{ fontSize: 12, color: "var(--on-surface-variant)", marginBottom: 8 }}>
                 {listed.length} of {streams.length} sources
-                {testing ? ` · testing speed of ${testing}…` : tested ? ` · ${tested} speed-tested` : ""}
                 {checking ? " · checking which releases have peers…" : hiddenStreams.length ? ` · ${hiddenStreams.length} without peers hidden` : ""}
               </div>
+              {progressText && (
+                <div style={{ marginBottom: 10 }} aria-label={progressText}>
+                  <div style={{ fontSize: 12, color: "var(--on-surface-variant)" }}>{progressText}</div>
+                  <div style={{ height: 4, borderRadius: 2, marginTop: 4, background: "var(--surface-container-highest)", overflow: "hidden" }}>
+                    <div style={{ height: 4, width: `${Math.round((100 * progress.tested) / progress.total)}%`, background: "var(--primary)", transition: "width 300ms" }} />
+                  </div>
+                </div>
+              )}
               <div style={{ flex: 1, overflowY: "auto", paddingRight: 4 }}>
                 {listed.map((stream, index) => {
                   const hash = streamInfoHash(stream);

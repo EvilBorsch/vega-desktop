@@ -25,8 +25,30 @@ export type SwarmTestResult = {
 /** Candidates tested at once; enough to fill the first screen of the list. */
 export const SWARM_TEST_BATCH = 8;
 export const SWARM_TEST_SECONDS = 10;
-// Swarms change slowly; a result stays useful for the session's next choices.
-const RESULT_TTL_MS = 15 * 60 * 1000;
+// Swarms change slowly; a result stays useful for the next choices, also
+// after the app restarts.
+const RESULT_TTL_MS = 30 * 60 * 1000;
+const SAVED_KEY = 'SwarmTests:v1';
+const SAVED_LIMIT = 400;
+
+const loadSaved = (): Record<string, SwarmTestResult> => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SAVED_KEY) || '{}') as Record<string, SwarmTestResult>;
+    const now = Date.now();
+    return Object.fromEntries(Object.entries(saved).filter(([, result]) => result && now - result.testedAt < RESULT_TTL_MS));
+  } catch {
+    return {};
+  }
+};
+
+const save = (results: Record<string, SwarmTestResult>) => {
+  try {
+    const latest = Object.entries(results)
+      .sort(([, a], [, b]) => b.testedAt - a.testedAt)
+      .slice(0, SAVED_LIMIT);
+    localStorage.setItem(SAVED_KEY, JSON.stringify(Object.fromEntries(latest)));
+  } catch {}
+};
 
 type SwarmTestState = {
   results: Record<string, SwarmTestResult>;
@@ -38,7 +60,7 @@ type SwarmTestState = {
 };
 
 export const useSwarmTestStore = create<SwarmTestState>(set => ({
-  results: {},
+  results: loadSaved(),
   running: {},
   failures: {},
   start: hashes => set(state => ({running: {...state.running, ...Object.fromEntries(hashes.map(hash => [hash, true as const]))}})),
@@ -52,6 +74,7 @@ export const useSwarmTestStore = create<SwarmTestState>(set => ({
       next[hash] = {...result, testedAt: now};
       if (!result.metadata) failures[hash] = (failures[hash] || 0) + 1;
     }
+    save(next);
     return {running, results: next, failures};
   }),
 }));
@@ -77,8 +100,11 @@ export const expectedSpeed = (stream: Stream, result?: SwarmTestResult): number 
   const text = [...(stream.tags || []), stream.tag || ''].join(' ');
   const online = Number(text.match(/👥\s*(\d+)/)?.[1] || 0);
   const snapshot = Number(text.match(/≈(\d+) seeders/)?.[1] || 0);
+  const snapshotLeechers = Number(text.match(/≈\d+ seeders, (\d+) leechers/)?.[1] || 0);
   const seeders = liveSeeders(stream) || 0;
-  return Math.max(seeders * 50_000, online * 30_000, snapshot * 5_000);
+  // Leechers upload the pieces they have, a fraction of what a seed sends.
+  const leechers = Number(text.match(/⬇\s*(\d+)/)?.[1] || 0);
+  return Math.max(seeders * 50_000 + leechers * 15_000, online * 30_000, snapshot * 5_000 + snapshotLeechers * 1_500);
 };
 
 export type SourceSort = 'speed' | 'quality';
@@ -139,6 +165,23 @@ export const knownPeers = (link: string): string[] => {
     .map(peer => peer.replace(/^[a-z]+:\/\//i, ''))
     .filter(peer => /^[\d.]+:\d+$|^\[[0-9a-f:]+\]:\d+$/i.test(peer))
     .slice(0, 30);
+};
+
+/** How far the speed check of a list has come. */
+export const testProgress = (streams: Stream[], results: Record<string, SwarmTestResult>, running: Record<string, true>) => {
+  const hashes = [...new Set(streams.filter(stream => stream.type === 'torrent').map(streamInfoHash).filter(Boolean))] as string[];
+  return {
+    total: hashes.length,
+    tested: hashes.filter(hash => freshResult(results, hash)).length,
+    testing: hashes.filter(hash => running[hash]).length,
+  };
+};
+
+/** One line on the speed check, for the top of a source list. */
+export const describeProgress = ({total, tested, testing}: ReturnType<typeof testProgress>): string | undefined => {
+  if (!total) return undefined;
+  if (testing) return `Checking speed: ${tested} of ${total} releases done, ${testing} in progress…`;
+  return tested ? `Speed checked for ${tested} of ${total} releases · fastest first` : undefined;
 };
 
 /** Picks the releases to test next: the first untested torrents of a list. */
