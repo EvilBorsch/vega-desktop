@@ -1,3 +1,4 @@
+import {torrentInfoHash} from '../providers/torrentIdentity';
 import {useCallback, useMemo, useState} from 'react';
 import {useQuery} from '@tanstack/react-query';
 import {torrentEngine} from '../services/torrentEngine';
@@ -12,7 +13,7 @@ const DEAD_KEY = 'DeadReleases:v1';
 const DEAD_TTL_MS = 24 * 60 * 60 * 1000;
 
 export const streamInfoHash = (stream?: Pick<Stream, 'link'>): string | undefined =>
-  stream?.link?.match(/[?&]xt=urn:btih:([a-f0-9]{40})(?:&|$)/i)?.[1]?.toLowerCase();
+  torrentInfoHash(stream?.link);
 
 /** A seeder count an index measured recently ("👤12"), not an old snapshot. */
 export const liveSeeders = (stream: Pick<Stream, 'tag' | 'tags'>): number | undefined => {
@@ -28,13 +29,12 @@ const SWARM_TAG = /^(?:👤\s*\d+|S:\s*\d+|⬇\s*\d+|≈\d+ seeders.*|👥\s*\d+
 
 /**
  * The release with its swarm counts replaced by what public trackers say now.
- * Index snapshots are often months old (JacRed matched a live scrape for 15%
- * of releases); an index's own live count is kept when it is higher, as it
- * may know trackers the scrape did not ask.
+ * A successful current response, including zero, replaces an older advertised
+ * count. No response leaves the provider metadata available as a fallback.
  */
 export const withLiveCounts = (stream: Stream, live?: {seeders: number; leechers: number}): Stream => {
-  if (!live || live.seeders + live.leechers <= 0) return stream;
-  const seeders = Math.max(live.seeders, liveSeeders(stream) || 0);
+  if (!live) return stream;
+  const seeders = Math.max(0, live.seeders);
   const swarm = [`👤${seeders}`, ...(live.leechers > 0 ? [`⬇${live.leechers}`] : [])];
   const splice = (parts: string[]) => {
     const at = parts.findIndex(part => SWARM_TAG.test(part.trim()));
@@ -45,7 +45,7 @@ export const withLiveCounts = (stream: Stream, live?: {seeders: number; leechers
   return {
     ...stream,
     tags: splice(stream.tags || []),
-    tag: stream.tag ? splice(stream.tag.split(' • ')).join(' • ') : stream.tag,
+    tag: stream.tag ? splice(stream.tag.split(/\s*[•·\n]\s*/)).join(' • ') : stream.tag,
   };
 };
 
@@ -98,7 +98,6 @@ export const applySwarmHealth = (
   keep: Set<string>,
   scrape?: SwarmScrape,
 ): {visible: Stream[]; hidden: Stream[]} => {
-  const conclusive = probeIsConclusive(probe);
   const visible: Stream[] = [];
   const hidden: Stream[] = [];
   for (const listed of streams) {
@@ -113,7 +112,7 @@ export const applySwarmHealth = (
     }
     const peers = probe?.peers[hash];
     const seeded = (liveSeeders(stream) || 0) > 0;
-    if (dead.has(hash) || (conclusive && peers === 0 && !seeded)) {
+    if (dead.has(hash)) {
       hidden.push(withTag(stream, 'No peers'));
       continue;
     }
@@ -136,7 +135,7 @@ export const useSwarmHealth = (
   );
   const [deadVersion, setDeadVersion] = useState(0);
   // Live counts from public trackers, asked once per list.
-  const {data: scrape} = useQuery({
+  const {data: scrape, isFetching: fetchingCounts} = useQuery({
     queryKey: ['swarmScrape', hashes.join(',')],
     queryFn: async (): Promise<SwarmScrape> => torrentEngine<SwarmScrape>('/swarm/scrape', {hashes}),
     enabled: enabled && isTauriRuntime() && hashes.length > 0,
@@ -161,5 +160,5 @@ export const useSwarmHealth = (
     markReleaseDead(hash);
     setDeadVersion(version => version + 1);
   }, []);
-  return {...result, checking: enabled && isFetching && !probe && hashes.length > 0, markDead};
+  return {...result, checking: enabled && hashes.length > 0 && (fetchingCounts || (isFetching && !probe)), markDead};
 };

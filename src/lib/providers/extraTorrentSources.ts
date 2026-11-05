@@ -1,3 +1,4 @@
+import {torrentInfoHash, mergeTorrentMagnets} from './torrentIdentity';
 import {platformFetch} from '../../platform/network';
 import type {Stream} from './types';
 
@@ -35,16 +36,20 @@ const requestJson = async (
  * Every source is optional: a failing or slow one only drops its releases,
  * and a failing host is skipped for a while.
  */
+// Public servers verified on 2026-11-05. All support native JSON and Jackett.
 export const JACRED_HOSTS = [
   'https://jacred.su',
   'https://jac.red',
   'https://jacred.stream',
-  'https://jacred.pro',
-  'https://jr.maxvol.pro',
-  'https://jacred.viewbox.dev',
+  'https://jac.black',
+  'https://nmjc.duckdns.org',
+  'https://jac.stull.xyz',
 ];
-// Mirrors that only answer with their documented public key.
-const JACRED_KEYS: Record<string, string> = {'https://jacred.viewbox.dev': 'viewbox'};
+// Published public search keys, not user credentials.
+const JACRED_KEYS: Record<string, string> = {
+  'https://jacred.stream': 'pp',
+  'https://jac.stull.xyz': '1',
+};
 export const KNABEN_API = 'https://api.knaben.org/v1';
 
 const REQUEST_TIMEOUT_MS = 7000;
@@ -80,10 +85,17 @@ const TRACKER_NAMES: Record<string, string> = {
   toloka: 'Toloka',
   baibako: 'BaibaKo',
   hdrezka: 'HDRezka',
+  korsars: 'Korsars',
+  ultradox: 'Ultradox',
+  rudub: 'RuDub',
+  mazepa: 'Mazepa',
+  piratebay: 'The Pirate Bay',
+  yts: 'YTS',
+  nyaa: 'Nyaa',
   knaben: 'Knaben',
 };
 // JacRed trackers that index international releases rather than Russian ones.
-const INTERNATIONAL_TRACKERS = new Set(['knaben']);
+const INTERNATIONAL_TRACKERS = new Set(['knaben', 'piratebay', 'yts', 'nyaa']);
 const SERIES_TYPES = new Set(['serial', 'multserial', 'docuserial', 'tvshow']);
 const MOVIE_TYPES = new Set(['movie', 'multfilm', 'documovie']);
 
@@ -307,7 +319,7 @@ export const matchesWestern = (hit: WesternHit, target: TorrentioTarget): boolea
 };
 
 export const torrentHash = (link?: string): string =>
-  link?.match(/[?&]xt=urn:btih:([^&]+)/i)?.[1]?.toLowerCase() || '';
+  torrentInfoHash(link) || '';
 
 const formatSize = (bytes?: number, fallback?: string): string => {
   if (!bytes || bytes <= 0) return fallback?.replace(/ГБ/i, 'GB').replace(/МБ/i, 'MB') || '';
@@ -443,13 +455,15 @@ export const serverLabel = (names: string[]): string => {
 const PROBED_LANGUAGES: Record<string, string> = {rus: 'RU', eng: 'EN', ukr: 'UA', jpn: 'JA', kor: 'KO', fre: 'FR', fra: 'FR', ger: 'DE', deu: 'DE', spa: 'ES', ita: 'IT', por: 'PT', chi: 'ZH', zho: 'ZH', hin: 'HI'};
 
 export const jacredToStream = (torrent: JacredTorrent, now = Date.now()): Stream => {
-  const international = INTERNATIONAL_TRACKERS.has(torrent.tracker);
+  const trackers = [...new Set((torrent.trackers?.length ? torrent.trackers : [torrent.tracker])
+    .flatMap(tracker => tracker.split(',')).map(tracker => tracker.trim().toLowerCase()).filter(Boolean))];
+  const international = trackers.length > 0 && trackers.every(tracker => INTERNATIONAL_TRACKERS.has(tracker));
   // Knaben mirrors end their names with the index they came from: "... | The Pirate Bay".
   const origin = international ? torrent.title.match(/\s+\|\s*([^|]+)$/)?.[1]?.trim() : undefined;
   const title = origin ? torrent.title.slice(0, torrent.title.lastIndexOf('|')).trim() : torrent.title;
   const probed = [...new Set((torrent.languages || []).map(code => PROBED_LANGUAGES[code]).filter(Boolean))];
   return releaseStream({
-    server: origin || serverLabel((torrent.trackers?.length ? torrent.trackers : [torrent.tracker]).map(trackerName)),
+    server: origin || serverLabel(trackers.map(trackerName)),
     title,
     magnet: torrent.magnet!,
     quality: jacredQuality(torrent),
@@ -459,8 +473,8 @@ export const jacredToStream = (torrent: JacredTorrent, now = Date.now()): Stream
     languages: probed.length
       ? probed
       : international
-        ? releaseLanguages(title, origin || '')
-        : torrent.tracker === 'toloka' ? ['UA'] : ['RU'],
+        ? releaseLanguages(title, origin || trackers.join(' '))
+        : trackers.every(tracker => tracker === 'toloka' || tracker === 'mazepa') ? ['UA'] : ['RU'],
     extra: [voiceTag(torrent.voices)],
     size: formatSize(torrent.size, torrent.sizeName),
   });
@@ -490,29 +504,59 @@ const seedersOf = (stream: Stream): number => {
   return Number(text.match(/👤\s*(\d+)/)?.[1] || text.match(/\bS:\s*(\d+)/i)?.[1] || 0);
 };
 
-/**
- * Torrentio results keep their own relative order. A duplicate from another
- * source only lends its release name and its tracker list: Torrentio magnets
- * carry no trackers, so peers come slower without them.
- */
+// The same info hash can be listed by a Russian tracker and an international
+// index. Keep all known audio labels when selecting the strongest record.
+const mergeStreamLanguages = (stream: Stream, others: Stream[]): Stream => {
+  const languageTags = new Set([...Object.values(PROBED_LANGUAGES), 'MULTI']);
+  const tagsOf = (item: Stream) => [...new Set([...(item.tags || []), ...(item.tag || '').split(/\s*[•·\n]\s*/)].filter(Boolean))];
+  const tags = tagsOf(stream);
+  const added = [...new Set(others.flatMap(tagsOf).filter(tag => languageTags.has(tag)))].filter(tag => !tags.includes(tag));
+  if (!added.length) return stream;
+  const merged = [...tags, ...added];
+  return {...stream, tags: merged, tag: merged.join(' • ')};
+};
+
+/** Merge only identical torrent hashes; different releases of a movie stay separate. */
+const mergeTorrentGroup = (best: Stream, group: Stream[]): Stream => {
+  const link = mergeTorrentMagnets(best.link, group.map(stream => stream.link));
+  if (group.length === 1 && link === best.link) return best;
+  return {
+    ...mergeStreamLanguages(best, group),
+    link,
+    title: best.title || group.find(stream => stream.title)?.title,
+    server: serverLabel([best, ...group].flatMap(stream => stream.server.split(' · '))),
+  };
+};
+
+/** Deduplicate provider rows too, even when every additional source is offline. */
 export const mergeTrackerStreams = (primary: Stream[], extra: Stream[]): Stream[] => {
-  if (!extra.length) return primary;
   const byHash = new Map<string, Stream>();
-  for (const stream of extra) {
-    const hash = torrentHash(stream.link);
-    const known = byHash.get(hash);
-    if (hash && (!known || seedersOf(stream) > seedersOf(known))) byHash.set(hash, stream);
+  for (const stream of mergeByHash(extra)) {
+    const hash = stream.type === 'torrent' ? torrentHash(stream.link) : '';
+    if (hash) byHash.set(hash, stream);
   }
-  const merged = primary.map(stream => {
-    const hash = torrentHash(stream.link);
+  const unique: Stream[] = [];
+  const positions = new Map<string, number>();
+  for (const stream of primary) {
+    const hash = stream.type === 'torrent' ? torrentHash(stream.link) : '';
+    const at = hash ? positions.get(hash) : undefined;
+    if (at !== undefined) {
+      unique[at] = mergeTorrentGroup(unique[at], [unique[at], stream]);
+    } else {
+      if (hash) positions.set(hash, unique.length);
+      unique.push(hash ? mergeTorrentGroup(stream, [stream]) : stream);
+    }
+  }
+  const merged = unique.map(stream => {
+    const hash = stream.type === 'torrent' ? torrentHash(stream.link) : '';
     const twin = hash ? byHash.get(hash) : undefined;
     if (!twin) return stream;
     byHash.delete(hash);
-    const bare = stream.link.startsWith('magnet:') && !/[?&]tr=/i.test(stream.link);
-    return {...stream, title: stream.title || twin.title, link: bare ? twin.link : stream.link};
+    // Keep the provider's playback metadata and label while enriching its magnet.
+    return {...mergeTorrentGroup(stream, [stream, twin]), server: stream.server};
   });
   const added = [...byHash.values()];
-  if (!added.length) return merged;
+  if (!added.length) return merged.length === primary.length && merged.every((stream, index) => stream === primary[index]) ? primary : merged;
   const rank = (stream: Stream) => Number(stream.quality?.match(/\d{3,4}/)?.[0] || 0);
   const all = [...merged, ...added];
   // Debrid and direct links keep their place at the top.
@@ -535,6 +579,27 @@ const withDeadline = <T>(promise: Promise<T>, ms: number, fallback: T): Promise<
       value => { clearTimeout(timer); resolve(value); },
       () => { clearTimeout(timer); resolve(fallback); },
     );
+  });
+
+/** Keep completed sources when another source exceeds the search budget. */
+export const collectSearchResults = <T>(searches: Promise<T[]>[], ms: number): Promise<T[]> =>
+  new Promise(resolve => {
+    const results: T[] = [];
+    let pending = searches.length;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(results.slice());
+    };
+    const timer = setTimeout(finish, ms);
+    if (!pending) finish();
+    for (const search of searches) {
+      search.then(batch => { if (!done) results.push(...batch); }, () => {}).finally(() => {
+        if (!--pending) finish();
+      });
+    }
   });
 
 const searchCache = new Map<string, {at: number; results: Promise<any[]>}>();
@@ -627,10 +692,12 @@ export const mergeJacred = (torrents: JacredTorrent[]): JacredTorrent[] => {
   return [...groups.values()].map(group => {
     const ranked = [...group].sort((a, b) => (b.sid || 0) - (a.sid || 0) || updatedAt(b) - updatedAt(a));
     const best = ranked[0];
-    const trackers = [...new Set(ranked.flatMap(torrent => torrent.trackers?.length ? torrent.trackers : [torrent.tracker]))];
+    const trackers = [...new Set(ranked.flatMap(torrent => torrent.trackers?.length ? torrent.trackers : [torrent.tracker])
+      .flatMap(tracker => tracker.split(',')).map(tracker => tracker.trim().toLowerCase()).filter(Boolean))];
     const detailed = ranked.find(torrent => torrent.relased) || best;
     return {
       ...best,
+      magnet: best.magnet ? mergeTorrentMagnets(best.magnet, ranked.flatMap(torrent => torrent.magnet ? [torrent.magnet] : [])) : best.magnet,
       relased: best.relased || detailed.relased,
       types: best.types?.length ? best.types : detailed.types,
       seasons: best.seasons?.length ? best.seasons : detailed.seasons,
@@ -678,7 +745,7 @@ const searchJacred = (query: string): Promise<JacredTorrent[]> =>
   });
 
 // JacRed mirrors that also answer the Jackett API Lampa uses.
-export const JACRED_JACKETT_HOSTS = ['https://jac.red', 'https://jacred.su'];
+export const JACRED_JACKETT_HOSTS = [...JACRED_HOSTS];
 
 /** A result of JacRed's Jackett API (what Lampa queries). */
 export const jackettToJacred = (result: any): JacredTorrent | undefined => {
@@ -728,12 +795,14 @@ const searchJacredJackett = (target: TorrentioTarget, russian?: string): Promise
   };
   return cachedSearch(`jackett:${target.imdbId}:${title.toLowerCase()}`, async () => {
     const hosts = JACRED_JACKETT_HOSTS.filter(hostUsable);
-    const answers = await Promise.allSettled(hosts.map(host =>
-      getJson(host, '/api/v2.0/indexers/all/results', {...params, ...(JACRED_KEYS[host] ? {apikey: JACRED_KEYS[host]} : {})})));
-    const results = answers.flatMap(answer =>
-      answer.status === 'fulfilled' && Array.isArray(answer.value?.Results) ? answer.value.Results : []);
-    if (!results.length && answers.every(answer => answer.status === 'rejected')) throw new Error('JacRed Jackett API unreachable');
-    return mergeJacred(results.map(jackettToJacred).filter((torrent): torrent is JacredTorrent => Boolean(torrent)));
+    const results = await collectSearchResults<JacredTorrent>(hosts.map(async host => {
+      const data = await getJson(host, '/api/v2.0/indexers/all/results', {
+        ...params, ...(JACRED_KEYS[host] ? {apikey: JACRED_KEYS[host]} : {}),
+      });
+      if (!Array.isArray(data?.Results)) throw new Error('Unexpected JacRed Jackett response');
+      return data.Results.map(jackettToJacred).filter((torrent: JacredTorrent | undefined): torrent is JacredTorrent => Boolean(torrent));
+    }), REQUEST_TIMEOUT_MS + 500);
+    return mergeJacred(results);
   });
 };
 
@@ -946,12 +1015,12 @@ const searchJacredTarget = async (target: TorrentioTarget): Promise<Stream[]> =>
     TITLE_LOOKUP_BUDGET_MS,
     [] as string[],
   )).filter(title => !original.some(known => known.toLowerCase() === title.toLowerCase()));
-  const results = await Promise.allSettled([
+  const results = await collectSearchResults([
     searchJacredJackett(target, russian[0]),
     ...russian.map(searchJacred),
     ...searches,
-  ]);
-  return mergeJacred(fulfilled(results, 'JacRed'))
+  ], TOTAL_BUDGET_MS - TITLE_LOOKUP_BUDGET_MS - 1000);
+  return mergeJacred(results)
     .filter(torrent => matchesJacred(torrent, target))
     .map(torrent => jacredToStream(torrent));
 };
@@ -1152,26 +1221,27 @@ const swarmWeight = (stream: Stream): number => {
  */
 export const mergeByHash = (streams: Stream[]): Stream[] => {
   const groups = new Map<string, Stream[]>();
-  for (const stream of streams) {
-    const hash = torrentHash(stream.link);
-    if (hash) groups.set(hash, [...(groups.get(hash) || []), stream]);
-  }
+  streams.forEach((stream, index) => {
+    const hash = stream.type === 'torrent' ? torrentHash(stream.link) : '';
+    const key = hash || `unidentified:${index}`;
+    groups.set(key, [...(groups.get(key) || []), stream]);
+  });
   return [...groups.values()].map(group => {
     const best = group.reduce((a, b) => (swarmWeight(b) > swarmWeight(a) ? b : a));
-    const names = [best, ...group.filter(stream => stream !== best)].flatMap(stream => stream.server.split(' · '));
-    return group.length > 1 ? {...best, server: serverLabel(names)} : best;
+    return mergeTorrentGroup(best, group);
   });
 };
 
+
 const searchTarget = async (target: TorrentioTarget): Promise<Stream[]> => {
-  const [rutor, jacred, western, addons] = await Promise.all([
-    searchRutorTarget(target).catch(() => [] as Stream[]),
-    searchJacredTarget(target).catch(() => [] as Stream[]),
-    searchWesternTarget(target).catch(() => [] as Stream[]),
-    searchAddonsTarget(target).catch(() => [] as Stream[]),
-  ]);
-  const streams = mergeByHash([...rutor, ...jacred, ...western, ...addons]);
-  console.log(`Extra torrent sources for ${target.imdbId}: Rutor ${rutor.length}, JacRed ${jacred.length}, international ${western.length}, addons ${addons.length}, unique ${streams.length}`);
+  const results = await collectSearchResults([
+    searchRutorTarget(target),
+    searchJacredTarget(target),
+    searchWesternTarget(target),
+    searchAddonsTarget(target),
+  ], TOTAL_BUDGET_MS);
+  const streams = mergeByHash(results);
+  console.log(`Extra torrent sources for ${target.imdbId}: unique ${streams.length}`);
   return streams;
 };
 
@@ -1188,7 +1258,7 @@ export const fetchExtraTorrentStreams = (
   return new Promise(resolve => {
     const abort = () => resolve([]);
     signal?.addEventListener('abort', abort);
-    withDeadline(searchTarget(target), TOTAL_BUDGET_MS, [] as Stream[]).then(streams => {
+    searchTarget(target).then(streams => {
       signal?.removeEventListener('abort', abort);
       resolve(streams);
     });

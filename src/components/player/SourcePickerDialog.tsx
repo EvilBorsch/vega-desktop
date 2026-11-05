@@ -102,10 +102,13 @@ export const SourcePickerDialog: React.FC<{
     [streams, hiddenStreams, showHidden, qualities, languages],
   );
   // Test in the order shown before the results arrive: best swarms first.
-  const candidates = useMemo(() => sortBySpeed(matching, {}, sort), [matching, sort]);
-  const { results, running, live } = useSwarmTests(candidates, true);
+  const candidates = useMemo(() => [...new Set([
+    ...sortBySpeed(matching, {}, sort),
+    ...sortBySpeed(streams, {}, sort),
+  ])], [matching, streams, sort]);
+  const { results, running, live } = useSwarmTests(candidates, !checking);
   const listed = useMemo(() => sortBySpeed(matching, results, sort), [matching, results, sort]);
-  const progress = testProgress(listed, results, running);
+  const progress = testProgress(candidates, results, running);
   const progressText = describeProgress(progress);
   const hint = slowLanguageHint(listed, streams, results, languages);
   // Swarms change: measure the listed releases again.

@@ -19,6 +19,8 @@ export type SwarmTestResult = {
   /** Addresses of peers that connected, to hand playback straight away. */
   peerList: string[];
   testedAt: number;
+  /** The measurement service failed; this is not evidence of an empty swarm. */
+  unavailable?: boolean;
   /** Still being measured: an estimate from the seconds so far. */
   provisional?: boolean;
 };
@@ -302,6 +304,7 @@ export const describeTest = (
     return {text: `Measuring… ${formatSpeed(sampleSpeed(live))} · ${peersText(live.peers, live.seeds)}`, tone: 'pending'};
   }
   if (!result) return running ? {text: 'Checking peers and speed…', tone: 'pending'} : undefined;
+  if (result.unavailable) return {text: running ? 'Checking peers and speed…' : 'Speed check unavailable', tone: 'pending'};
   if (!result.metadata) {
     return result.peers > 0
       ? {text: `${result.peers} peers connected but sent no torrent info — likely won't play`, tone: 'bad'}
@@ -352,7 +355,7 @@ export const slowLanguageHint = (
   const measured = listed
     .filter(stream => stream.type === 'torrent')
     .map(stream => freshResult(results, streamInfoHash(stream)))
-    .filter((result): result is SwarmTestResult => Boolean(result) && !result!.provisional);
+    .filter((result): result is SwarmTestResult => Boolean(result) && !result!.provisional && !result!.unavailable);
   const torrents = listed.filter(stream => stream.type === 'torrent').length;
   if (!measured.length || measured.length < Math.min(3, torrents)) return undefined;
   const best = Math.max(0, ...measured.map(result => (testFailed(result) ? 0 : Math.max(result.speed, result.maxSpeed * 0.5))));
@@ -388,18 +391,21 @@ export const nextToTest = (
   running: Record<string, true>,
   failures: Record<string, number> = {},
 ): string[] => {
-  const hashes: string[] = [];
+  const untested: string[] = [];
+  const retries: string[] = [];
+  const expired: string[] = [];
+  const seen = new Set<string>();
   for (const stream of streams) {
     if (stream.type !== 'torrent') continue;
     const hash = streamInfoHash(stream);
-    if (!hash || running[hash] || hashes.includes(hash)) continue;
+    if (!hash || running[hash] || seen.has(hash)) continue;
+    seen.add(hash);
     const result = freshResult(results, hash);
-    // A release that did not answer gets a second test; swarms answer unevenly.
-    if (result && !(testFailed(result) && (failures[hash] || 0) < 2)) continue;
-    hashes.push(hash);
-    if (hashes.length >= SWARM_TEST_BATCH) break;
+    if (!result) (results[hash] ? expired : untested).push(hash);
+    else if (testFailed(result) && (failures[hash] || 0) < 2) retries.push(hash);
   }
-  return hashes;
+  // Every release gets its first chance before a failed release is retried.
+  return [...untested, ...retries, ...expired].slice(0, SWARM_TEST_BATCH);
 };
 
 /** Keeps a tested release running for playback instead of removing it. */
@@ -409,11 +415,25 @@ export const claimSwarmTest = async (stream: Stream): Promise<void> => {
   await torrentEngine('/swarm/claim', {hash}).catch(() => {});
 };
 
+// Native monitor/stop commands share one engine. In particular, a delayed
+// cleanup must finish before a reopened source list starts its monitors.
+let swarmControlQueue: Promise<void> = Promise.resolve();
+const controlSwarmOperation = (operation: () => Promise<unknown>): Promise<void> => {
+  const run = swarmControlQueue.then(operation).then(() => {});
+  swarmControlQueue = run.catch(() => {});
+  return run;
+};
+const MISSING_SAMPLE_TIMEOUT_MS = 10_000;
+const unavailableResult = (): Omit<SwarmTestResult, 'testedAt'> => ({
+  peers: 0, seeds: 0, known: 0, metadata: false, speed: 0, maxSpeed: 0,
+  peerList: [], unavailable: true,
+});
+
 /**
- * Measures the top of a source list while it is shown, without blocking it:
+ * Measures the entire candidate list while it is shown, without blocking it:
  * up to six releases at a time download the start of their video, their
  * numbers are read every second, and a release that has been measured long
- * enough makes room for the next one down the (re-sorted) list. Leaving the
+ * enough makes room for the next candidate in the queue. Leaving the
  * list stops it.
  */
 export const useSwarmTests = (streams: Stream[], enabled: boolean) => {
@@ -425,6 +445,7 @@ export const useSwarmTests = (streams: Stream[], enabled: boolean) => {
     if (!enabled || !isTauriRuntime()) return;
     let stopped = false;
     let busy = false;
+    const lastSampleAt = new Map<string, number>();
     const tick = async () => {
       if (busy || stopped) return;
       busy = true;
@@ -435,20 +456,23 @@ export const useSwarmTests = (streams: Stream[], enabled: boolean) => {
           if (stopped) return;
           const settled: Record<string, Omit<SwarmTestResult, 'testedAt'>> = {};
           for (const hash of active) {
-            const result = stats[hash] && settleSample(stats[hash]);
+            if (!lastSampleAt.has(hash)) lastSampleAt.set(hash, Date.now());
+            if (stats[hash]) lastSampleAt.set(hash, Date.now());
+            const result = stats[hash] ? settleSample(stats[hash])
+              : Date.now() - lastSampleAt.get(hash)! >= MISSING_SAMPLE_TIMEOUT_MS ? unavailableResult() : undefined;
             if (result) settled[hash] = result;
           }
           useSwarmTestStore.getState().update(stats);
           const done = Object.keys(settled);
           if (done.length) {
             useSwarmTestStore.getState().finish(done, settled);
-            torrentEngine('/swarm/stop', {hashes: done}).catch(() => {});
+            controlSwarmOperation(() => torrentEngine('/swarm/stop', {hashes: done})).catch(() => {});
           }
         }
         let state = useSwarmTestStore.getState();
         const list = streamsRef.current;
         const busySlots = Object.values(state.live).filter(sample => sampleState(sample) !== 'stalled').length;
-        let wanted = nextToTest(list.slice(0, MAX_MONITORED + SWARM_TEST_BATCH), state.results, state.running, state.failures)
+        let wanted = nextToTest(list, state.results, state.running, state.failures)
           .slice(0, Math.max(0, MONITOR_CONCURRENCY - busySlots));
         // Watching is full: the release stalled longest gives its place.
         const room = MAX_MONITORED - Object.keys(state.live).length;
@@ -460,7 +484,7 @@ export const useSwarmTests = (streams: Stream[], enabled: boolean) => {
           if (evict.length) {
             const ended = Object.fromEntries(evict.map(([hash, sample]) => [hash, sampleResult(sample)]));
             state.finish(Object.keys(ended), ended);
-            torrentEngine('/swarm/stop', {hashes: Object.keys(ended)}).catch(() => {});
+            controlSwarmOperation(() => torrentEngine('/swarm/stop', {hashes: Object.keys(ended)})).catch(() => {});
             state = useSwarmTestStore.getState();
           }
           wanted = wanted.slice(0, Math.max(0, MAX_MONITORED - Object.keys(state.live).length));
@@ -468,8 +492,13 @@ export const useSwarmTests = (streams: Stream[], enabled: boolean) => {
         const hashes = wanted;
         if (!hashes.length) return;
         const magnets = hashes.map(hash => list.find(stream => streamInfoHash(stream) === hash)!.link);
+        for (const hash of hashes) lastSampleAt.set(hash, Date.now());
         state.start(hashes);
-        await torrentEngine('/swarm/monitor', {magnets}).catch(() => useSwarmTestStore.getState().drop(hashes));
+        await controlSwarmOperation(() => torrentEngine('/swarm/monitor', {magnets})).catch(() => {
+          if (stopped) return;
+          useSwarmTestStore.getState().finish(hashes, Object.fromEntries(hashes.map(hash => [hash, unavailableResult()])));
+          controlSwarmOperation(() => torrentEngine('/swarm/stop', {hashes})).catch(() => {});
+        });
       } finally {
         busy = false;
       }
@@ -481,7 +510,7 @@ export const useSwarmTests = (streams: Stream[], enabled: boolean) => {
       clearInterval(timer);
       const active = Object.keys(useSwarmTestStore.getState().live);
       useSwarmTestStore.getState().drop(active);
-      if (active.length) torrentEngine('/swarm/stop', {hashes: active}).catch(() => {});
+      if (active.length) controlSwarmOperation(() => torrentEngine('/swarm/stop', {hashes: active})).catch(() => {});
     };
   }, [enabled]);
   const running = useMemo(
