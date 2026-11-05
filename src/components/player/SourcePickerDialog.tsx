@@ -1,6 +1,6 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useFocusable, FocusContext } from "@noriginmedia/norigin-spatial-navigation-react";
-import { LuArrowLeft as ArrowLeft, LuPlay as Play } from "react-icons/lu";
+import { LuArrowLeft as ArrowLeft, LuPlay as Play, LuDownload as Download } from "react-icons/lu";
 import type { Stream } from "../../lib/providers/types";
 import { defaultStreamFilters, filterStreams, getStreamFilterOptions } from "../../lib/player/streamFilters";
 import { badgeLabel, streamBadges } from "../../lib/player/streamBadges";
@@ -15,6 +15,7 @@ import {
   testProgress,
   useSwarmTestStore,
   useSwarmTests,
+  stopSwarmTests,
   type SourceSort,
   type TestLine,
 } from "../../lib/player/swarmTests";
@@ -83,10 +84,16 @@ export const SourcePickerDialog: React.FC<{
   streams: Stream[];
   hiddenStreams?: Stream[];
   checking?: boolean;
+  loading?: boolean;
+  error?: string | null;
+  action?: "play" | "download";
+  modal?: boolean;
+  footer?: React.ReactNode;
+  renderSourceActions?: (stream: Stream) => React.ReactNode;
   subtitle?: string;
   onSelect: (stream: Stream) => void;
   onBack: () => void;
-}> = ({ streams, hiddenStreams = [], checking = false, subtitle, onSelect, onBack }) => {
+}> = ({ streams, hiddenStreams = [], checking = false, loading = false, error, action = "play", modal = false, footer, renderSourceActions, subtitle, onSelect, onBack }) => {
   const { ref, focusKey, focusSelf } = useFocusable({ isFocusBoundary: true, trackChildren: true, focusKey: "SOURCE_PICKER" });
   // Russian (else English) at the best quality until the viewer picks filters.
   const [chosen, setChosen] = useState<{ qualities: string[]; languages: string[] } | undefined>();
@@ -96,6 +103,12 @@ export const SourcePickerDialog: React.FC<{
   const setLanguages = (next: string[]) => setChosen({ qualities, languages: next });
   const [showHidden, setShowHidden] = useState(false);
   const [sort, setSort] = useState<SourceSort>("speed");
+  const selectingRef = useRef(false);
+  const activeRef = useRef(true);
+  useEffect(() => {activeRef.current = true; return () => {activeRef.current = false;};}, []);
+  const dismiss = () => {activeRef.current = false; onBack();};
+  const [selecting, setSelecting] = useState(false);
+  const [selectionError, setSelectionError] = useState<string>();
   const options = useMemo(() => getStreamFilterOptions(streams), [streams]);
   const matching = useMemo(
     () => filterStreams(showHidden ? [...streams, ...hiddenStreams] : streams, qualities, languages),
@@ -106,7 +119,7 @@ export const SourcePickerDialog: React.FC<{
     ...sortBySpeed(matching, {}, sort),
     ...sortBySpeed(streams, {}, sort),
   ])], [matching, streams, sort]);
-  const { results, running, live } = useSwarmTests(candidates, !checking);
+  const { results, running, live } = useSwarmTests(candidates, !loading && !checking && !selecting);
   const listed = useMemo(() => sortBySpeed(matching, results, sort), [matching, results, sort]);
   const progress = testProgress(candidates, results, running);
   const progressText = describeProgress(progress);
@@ -114,7 +127,23 @@ export const SourcePickerDialog: React.FC<{
   // Swarms change: measure the listed releases again.
   const recheck = () =>
     useSwarmTestStore.getState().recheck(listed.map(streamInfoHash).filter((hash): hash is string => Boolean(hash)));
-  const select = (stream: Stream) => {
+  const select = async (stream: Stream) => {
+    if (selectingRef.current) return;
+    if (action === "download") {
+      selectingRef.current = true;
+      setSelecting(true);
+      setSelectionError(undefined);
+      try {
+        await stopSwarmTests();
+        if (activeRef.current) onSelect(stream);
+      } catch {
+        if (!activeRef.current) return;
+        selectingRef.current = false;
+        setSelecting(false);
+        setSelectionError("Could not finish source checks. Please try again.");
+      }
+      return;
+    }
     // Keep the tested torrent (and its peers) for playback.
     void claimSwarmTest(stream).finally(() => onSelect(stream));
   };
@@ -122,6 +151,12 @@ export const SourcePickerDialog: React.FC<{
     const timer = setTimeout(() => focusSelf(), 30);
     return () => clearTimeout(timer);
   }, [focusSelf]);
+  useEffect(() => {
+    if (!modal) return;
+    const keydown = (event: KeyboardEvent) => {if (event.key === "Escape") {event.stopPropagation(); activeRef.current = false; onBack();}};
+    window.addEventListener("keydown", keydown);
+    return () => window.removeEventListener("keydown", keydown);
+  }, [modal, onBack]);
   const toggle = (values: string[], value: string) =>
     values.includes(value) ? values.filter((item) => item !== value) : [...values, value];
 
@@ -129,10 +164,13 @@ export const SourcePickerDialog: React.FC<{
     <FocusContext.Provider value={focusKey}>
       <div
         ref={ref}
+        role="dialog"
+        aria-modal="true"
+        aria-label={action === "download" ? "Choose a download source" : "Choose a source"}
         style={{
-          position: "absolute",
+          position: modal ? "fixed" : "absolute",
           inset: 0,
-          zIndex: 95,
+          zIndex: modal ? 10000 : 95,
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
@@ -154,15 +192,15 @@ export const SourcePickerDialog: React.FC<{
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
-            <FocusableButton focusKey="SOURCE_PICKER_BACK" aria-label="Go back" onClick={onBack} className="player-loading-back" style={{ position: "static" }}>
+            <FocusableButton focusKey="SOURCE_PICKER_BACK" aria-label="Go back" onClick={dismiss} className="player-loading-back" style={{ position: "static" }}>
               <ArrowLeft size={22} />
             </FocusableButton>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 22, fontWeight: 600 }}>Choose a source</div>
+              <div style={{ fontSize: 22, fontWeight: 600 }}>{action === "download" ? "Choose a download source" : "Choose a source"}</div>
               {subtitle && <div style={{ fontSize: 13, color: "var(--on-surface-variant)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{subtitle}</div>}
             </div>
           </div>
-          <div style={{ display: "flex", gap: 20, flex: 1, minHeight: 0 }}>
+          {loading ? <div role="status" style={{flex: 1, display: "grid", placeItems: "center"}}>Searching for sources…</div> : <div style={{ display: "flex", gap: 20, flex: 1, minHeight: 0 }}>
             <div style={{ width: 220, flexShrink: 0, overflowY: "auto" }}>
               <div style={{ fontSize: 12, color: "var(--on-surface-variant)", margin: "4px 0 8px" }}>Quality</div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
@@ -223,10 +261,11 @@ export const SourcePickerDialog: React.FC<{
                   // Stable per release, so focus stays on it when the list re-sorts.
                   const itemKey = hash ? `${hash}_${stream.server}` : `${index}`;
                   return (
-                  <FocusableButton
+                  <React.Fragment key={itemKey}><FocusableButton
                     key={itemKey}
                     focusKey={`SOURCE_ITEM_${itemKey}`}
                     onClick={() => select(stream)}
+                    aria-label={`${action === "download" ? "Download" : "Play"} ${stream.server}`}
                     style={{
                       display: "block",
                       width: "100%",
@@ -241,7 +280,7 @@ export const SourcePickerDialog: React.FC<{
                     }}
                   >
                     <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
-                      <Play size={18} color="var(--primary)" />
+                      {action === "download" ? <Download size={18} color="var(--primary)" /> : <Play size={18} color="var(--primary)" />}
                       <span style={{ fontSize: 16, fontWeight: 600 }}>{stream.server}</span>
                     </div>
                     {stream.title && (
@@ -253,12 +292,12 @@ export const SourcePickerDialog: React.FC<{
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                       {streamBadges(stream).map((badge) => <Badge key={badge} text={badge} />)}
                     </div>
-                  </FocusableButton>
+                  </FocusableButton>{renderSourceActions?.(stream)}</React.Fragment>
                   );
                 })}
                 {!listed.length && (
                   <div style={{ color: "var(--on-surface-variant)", padding: 12 }}>
-                    {streams.length ? "No matching sources. Change the quality or language filters." : "No servers available"}
+                    {streams.length ? "No matching sources. Change the quality or language filters." : error || "No servers available"}
                   </div>
                 )}
                 {hiddenStreams.length > 0 && (
@@ -272,7 +311,9 @@ export const SourcePickerDialog: React.FC<{
                 )}
               </div>
             </div>
-          </div>
+          </div>}
+          {footer}
+          {selectionError && <div role="alert">{selectionError}</div>}
         </div>
       </div>
     </FocusContext.Provider>

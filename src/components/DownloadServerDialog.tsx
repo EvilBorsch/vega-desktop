@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useMemo } from "react";
 import {
   LuX as X,
-  LuServer as Server,
   LuDownload as Download,
   LuCircleAlert as AlertCircle,
   LuCopy as Copy,
@@ -18,6 +17,25 @@ import {
 } from "@noriginmedia/norigin-spatial-navigation-react";
 import { settingsStorage } from "../lib/storage";
 import "./DownloadServerDialog.css";
+import {SourcePickerDialog} from "./player/SourcePickerDialog";
+import {useSwarmHealth} from "../lib/player/swarmHealth";
+
+const KEEP_DOWNLOAD_SOURCES = new Set<string>();
+function DownloadSourcePicker({streams, loading, error, episodeTitle, onSelect, onClose, footer, renderSourceActions}: {
+  streams: Stream[];
+  loading: boolean;
+  error?: string | null;
+  episodeTitle: string;
+  onSelect: (stream: Stream) => void;
+  onClose: () => void;
+  footer?: React.ReactNode;
+  renderSourceActions?: (stream: Stream) => React.ReactNode;
+}) {
+  const swarm = useSwarmHealth(streams, {enabled: !loading, keep: KEEP_DOWNLOAD_SOURCES});
+  return <SourcePickerDialog streams={swarm.visible} hiddenStreams={swarm.hidden} checking={swarm.checking}
+    action="download" modal loading={loading} error={error} subtitle={episodeTitle} onBack={onClose}
+    onSelect={stream => {onSelect(stream); onClose();}} footer={footer} renderSourceActions={renderSourceActions} />;
+}
 
 export interface DownloadedSubtitleItem {
   id: string;
@@ -66,6 +84,7 @@ export const DownloadServerDialog: React.FC<DownloadServerDialogProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<"video" | "subtitles">("video");
   const [copiedLink, setCopiedLink] = useState<string | null>(null);
+  const management = Boolean(downloaded) || activeTab === "subtitles";
 
   const tvMode = settingsStorage.isTvModeEnabled();
   const {
@@ -73,7 +92,7 @@ export const DownloadServerDialog: React.FC<DownloadServerDialogProps> = ({
     focusKey,
     focusSelf,
   } = useFocusable({
-    focusable: tvMode && isOpen,
+    focusable: tvMode && isOpen && management,
     trackChildren: true,
     isFocusBoundary: true,
   });
@@ -81,22 +100,23 @@ export const DownloadServerDialog: React.FC<DownloadServerDialogProps> = ({
   useEffect(() => {
     if (isOpen) {
       setActiveTab("video");
-      if (tvMode) {
-        setTimeout(() => {
-          focusSelf();
-        }, 100);
-      }
     }
   }, [isOpen, tvMode, focusSelf]);
 
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen || !tvMode || !management) return;
+    const timer = setTimeout(() => focusSelf(), 100);
+    return () => clearTimeout(timer);
+  }, [isOpen, tvMode, management, focusSelf]);
+
+  useEffect(() => {
+    if (!isOpen || !management) return;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [isOpen, onClose]);
+  }, [isOpen, onClose, management]);
 
   const rawSubtitles = useMemo(
     () => streams.flatMap((server) => server.subtitles || []).filter(Boolean),
@@ -142,6 +162,18 @@ export const DownloadServerDialog: React.FC<DownloadServerDialogProps> = ({
     setCopiedLink(link);
     setTimeout(() => setCopiedLink(null), 2000);
   };
+
+  if (!downloaded && activeTab === "video") {
+    return <DownloadSourcePicker streams={streams} loading={loading} error={error} episodeTitle={episodeTitle} onSelect={onSelect} onClose={onClose}
+      renderSourceActions={stream => <div style={{display: "flex", justifyContent: "flex-end", marginBottom: 8}}>
+        <FocusableButton onClick={event => handleCopy(event, stream.link)} aria-label={`Copy link for ${stream.server}`} className="icon-btn" style={{padding: 8}}>
+          {copiedLink === stream.link ? <Check size={18} /> : <Copy size={18} />}
+        </FocusableButton>
+      </div>}
+      footer={hasSubtitles ? <FocusableButton onClick={() => setActiveTab("subtitles")} style={{padding: 10}}>
+        Subtitles ({downloadedSubtitles.length + streamSubtitles.length})
+      </FocusableButton> : undefined} />;
+  }
 
   return (
     <FocusContext.Provider value={focusKey}>
@@ -217,95 +249,7 @@ export const DownloadServerDialog: React.FC<DownloadServerDialogProps> = ({
                       </FocusableButton>
                     )}
                   </div>
-                ) : loading ? (
-                  <div className="empty-state-dialog">
-                    <Loader size={68} className="spin text-primary mb-sm" />
-                  </div>
-                ) : error || streams.length === 0 ? (
-                  <div className="empty-state-dialog">
-                    <AlertCircle size={40} className="mb-sm text-yellow-500" />
-                    <p>{error || "No downloadable streams found."}</p>
-                  </div>
-                ) : (
-                  <div className="stream-list">
-                    {streams.map((stream, idx) => (
-                      <FocusableButton
-                        key={idx}
-                        className="stream-item"
-                        onClick={() => {
-                          onSelect(stream);
-                          onClose();
-                        }}
-                      >
-                        <div className="stream-icon">
-                          <Server size={20} />
-                        </div>
-                        <div className="stream-details">
-                          <h4
-                            className="label-lg"
-                            title={stream.server || "Unknown Server"}
-                          >
-                            {stream.server || "Unknown Server"}
-                          </h4>
-                          <div className="stream-badges">
-                            <span className="quality-badge">
-                              {stream.quality
-                                ? `${stream.quality}`
-                                : stream.type.toUpperCase()}
-                            </span>
-                            {(() => {
-                              const rawTags: string[] = Array.isArray(stream.tags)
-                                ? stream.tags
-                                : typeof stream.tag === "string"
-                                ? [stream.tag]
-                                : [];
-                              const tags = rawTags
-                                .map((t) => (typeof t === "string" ? t.trim() : ""))
-                                .filter(
-                                  (t) =>
-                                    Boolean(t) &&
-                                    t.toLowerCase() !==
-                                      stream.quality?.trim().toLowerCase(),
-                                );
-
-                              return tags.map((t, tIdx) => (
-                                <span key={tIdx} className="quality-badge tag-badge">
-                                  {t.toUpperCase()}
-                                </span>
-                              ));
-                            })()}
-                          </div>
-                        </div>
-                        <div
-                          className="stream-action"
-                          style={{
-                            display: "flex",
-                            gap: "8px",
-                            alignItems: "center",
-                          }}
-                        >
-                          <FocusableButton
-                            className="copy-btn"
-                            onClick={(e: any) => handleCopy(e, stream.link)}
-                            title="Copy Stream Link"
-                            style={{
-                              border: "none",
-                              background: "transparent",
-                              padding: "8px",
-                            }}
-                          >
-                            {copiedLink === stream.link ? (
-                              <Check size={20} className="text-green-500" />
-                            ) : (
-                              <Copy size={20} />
-                            )}
-                          </FocusableButton>
-                          <Download size={20} />
-                        </div>
-                      </FocusableButton>
-                    ))}
-                  </div>
-                )}
+                ) : null}
               </>
             ) : (
               <div className="stream-list">

@@ -423,6 +423,15 @@ const controlSwarmOperation = (operation: () => Promise<unknown>): Promise<void>
   swarmControlQueue = run.catch(() => {});
   return run;
 };
+
+/** Remove temporary measurement files before a download chooses its output folder. */
+export const stopSwarmTests = async (): Promise<void> => {
+  const state = useSwarmTestStore.getState();
+  const active = Object.keys(state.live);
+  state.drop(active);
+  await controlSwarmOperation(() => active.length && isTauriRuntime()
+    ? torrentEngine('/swarm/stop', {hashes: active}) : Promise.resolve());
+};
 const MISSING_SAMPLE_TIMEOUT_MS = 10_000;
 const unavailableResult = (): Omit<SwarmTestResult, 'testedAt'> => ({
   peers: 0, seeds: 0, known: 0, metadata: false, speed: 0, maxSpeed: 0,

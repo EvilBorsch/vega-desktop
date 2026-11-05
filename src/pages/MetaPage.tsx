@@ -27,7 +27,7 @@ import { useContentDetails } from "../lib/hooks/useContentInfo";
 import { useEpisodes } from "../lib/hooks/useEpisodes";
 import { useImageIsPortrait } from "../lib/hooks/useImageIsPortrait";
 import type { EpisodeLink, Link, Stream, SkipInterval } from "../lib/providers/types";
-import { providerManager } from "../lib/services/ProviderManager";
+import {getStreamSources} from "../lib/services/getStreamSources";
 import { cacheStorage, type WatchHistoryItem } from "../lib/storage";
 import { settingsStorage } from "../lib/storage/SettingsStorage";
 import useContentStore from "../lib/zustand/contentStore";
@@ -509,7 +509,7 @@ export const MetaPage: React.FC = () => {
     setIsDialogLoading(true);
     setExtractingId(id);
     try {
-      const streams = await providerManager.getStream({
+      const streams = await getStreamSources({
         link: episode.link,
         type,
         signal: new AbortController().signal,
@@ -686,7 +686,7 @@ export const MetaPage: React.FC = () => {
             skipped++;
             continue;
           }
-          const streams = await providerManager.getStream({
+          const streams = await getStreamSources({
             link: episode.link, type: rowType, signal: controller.signal,
             providerValue: activeProviderValue, isDownload: true,
           });

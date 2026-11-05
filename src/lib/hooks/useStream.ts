@@ -3,11 +3,10 @@ import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {isTauriRuntime} from "../../platform/host";
 
-import { providerManager } from "../services/ProviderManager";
+import {getStreamSources} from "../services/getStreamSources";
 import { settingsStorage } from "../storage";
 
 import { Stream } from "../providers/types";
-import { fetchExtraTorrentStreams, mergeTrackerStreams } from "../providers/extraTorrentSources";
 import {
   findRememberedServer,
   findSimilarStream,
@@ -227,23 +226,9 @@ export const useStream = ({
       let data: Stream[] = [];
       const providerValue = routeParams?.providerValue || provider;
       const controller = new AbortController();
-      const extraStreams = providerValue === "torrentio"
-        ? fetchExtraTorrentStreams(remoteLink, routeParams?.type, controller.signal)
-        : Promise.resolve([] as Stream[]);
       try {
-        try {
-          data =
-            (await providerManager.getStream({
-              link: remoteLink,
-              type: routeParams?.type,
-              signal: controller.signal,
-              providerValue,
-            })) || [];
-        } catch (providerError) {
-          if (!(await extraStreams).length) throw providerError;
-          console.warn("Provider streams failed; showing tracker releases:", providerError);
-        }
-        data = mergeTrackerStreams(data, await extraStreams);
+        data = await getStreamSources({link: remoteLink, type: routeParams?.type,
+          signal: controller.signal, providerValue});
       } catch (error) {
         if (localStream) {
           console.warn(
