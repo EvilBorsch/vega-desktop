@@ -1,6 +1,6 @@
 import {useEffect, useMemo, useRef} from 'react';
 import {create} from 'zustand';
-import {invoke} from '@tauri-apps/api/core';
+import {torrentEngine} from '../services/torrentEngine';
 import type {Stream} from '../providers/types';
 import {isTauriRuntime} from '../../platform/host';
 import {liveSeeders, streamInfoHash} from './swarmHealth';
@@ -319,7 +319,7 @@ export const describeTest = (
   return {text: `${formatSpeed(speed)} · ${peers}`, tone};
 };
 
-/** Peers a recent test connected to, as librqbit's `initial_peers` takes them. */
+/** Peers a recent test connected to, as the engine's `initial_peers` takes them. */
 export const knownPeers = (link: string): string[] => {
   const hash = streamInfoHash({link});
   const result = freshResult(useSwarmTestStore.getState().results, hash);
@@ -406,7 +406,7 @@ export const nextToTest = (
 export const claimSwarmTest = async (stream: Stream): Promise<void> => {
   const hash = streamInfoHash(stream);
   if (!hash || !isTauriRuntime()) return;
-  await invoke('claim_swarm_test', {infoHash: hash}).catch(() => {});
+  await torrentEngine('/swarm/claim', {hash}).catch(() => {});
 };
 
 /**
@@ -431,7 +431,7 @@ export const useSwarmTests = (streams: Stream[], enabled: boolean) => {
       try {
         const active = Object.keys(useSwarmTestStore.getState().live);
         if (active.length) {
-          const stats: Record<string, LiveSample> = await invoke<Record<string, LiveSample>>('swarm_stats', {hashes: active}).catch(() => ({}));
+          const stats: Record<string, LiveSample> = await torrentEngine<Record<string, LiveSample>>('/swarm/stats', {hashes: active}).catch(() => ({}));
           if (stopped) return;
           const settled: Record<string, Omit<SwarmTestResult, 'testedAt'>> = {};
           for (const hash of active) {
@@ -442,7 +442,7 @@ export const useSwarmTests = (streams: Stream[], enabled: boolean) => {
           const done = Object.keys(settled);
           if (done.length) {
             useSwarmTestStore.getState().finish(done, settled);
-            invoke('stop_swarm_monitor', {hashes: done}).catch(() => {});
+            torrentEngine('/swarm/stop', {hashes: done}).catch(() => {});
           }
         }
         let state = useSwarmTestStore.getState();
@@ -460,7 +460,7 @@ export const useSwarmTests = (streams: Stream[], enabled: boolean) => {
           if (evict.length) {
             const ended = Object.fromEntries(evict.map(([hash, sample]) => [hash, sampleResult(sample)]));
             state.finish(Object.keys(ended), ended);
-            invoke('stop_swarm_monitor', {hashes: Object.keys(ended)}).catch(() => {});
+            torrentEngine('/swarm/stop', {hashes: Object.keys(ended)}).catch(() => {});
             state = useSwarmTestStore.getState();
           }
           wanted = wanted.slice(0, Math.max(0, MAX_MONITORED - Object.keys(state.live).length));
@@ -469,7 +469,7 @@ export const useSwarmTests = (streams: Stream[], enabled: boolean) => {
         if (!hashes.length) return;
         const magnets = hashes.map(hash => list.find(stream => streamInfoHash(stream) === hash)!.link);
         state.start(hashes);
-        await invoke('monitor_swarms', {magnets}).catch(() => useSwarmTestStore.getState().drop(hashes));
+        await torrentEngine('/swarm/monitor', {magnets}).catch(() => useSwarmTestStore.getState().drop(hashes));
       } finally {
         busy = false;
       }
@@ -481,7 +481,7 @@ export const useSwarmTests = (streams: Stream[], enabled: boolean) => {
       clearInterval(timer);
       const active = Object.keys(useSwarmTestStore.getState().live);
       useSwarmTestStore.getState().drop(active);
-      if (active.length) invoke('stop_swarm_monitor', {hashes: active}).catch(() => {});
+      if (active.length) torrentEngine('/swarm/stop', {hashes: active}).catch(() => {});
     };
   }, [enabled]);
   const running = useMemo(

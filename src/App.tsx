@@ -33,6 +33,7 @@ import { updateProvidersService } from "./lib/services/UpdateProviders";
 import { extensionManager } from "./lib/services/ExtensionManager";
 import { extensionStorage } from "./lib/storage/extensionStorage";
 import useContentStore from "./lib/zustand/contentStore";
+import { DEFAULT_PROVIDER_RETRY_DELAYS, retryWithDelays } from "./lib/utils/retryWithDelays";
 import {
   init as initNavigation,
   setFocus,
@@ -227,15 +228,18 @@ export default function App() {
   useEffect(() => {
     // Ready without setup: the provider source and Torrentio are installed on
     // first launch, also when automatic provider updates are off.
-    extensionManager
-      .ensureDefaultProviders()
-      .then(() => {
-        const providers = extensionStorage.getInstalledProviders();
-        const store = useContentStore.getState();
-        store.setInstalledProviders(providers);
-        if (!store.provider?.value && providers.length) store.setProvider(providers[0]);
-      })
-      .catch((error) => console.warn("Default provider setup will retry on next launch:", error));
+    // A network error on first launch is retried a few times.
+    return retryWithDelays(
+      () =>
+        extensionManager.ensureDefaultProviders().then(() => {
+          const providers = extensionStorage.getInstalledProviders();
+          const store = useContentStore.getState();
+          store.setInstalledProviders(providers);
+          if (!store.provider?.value && providers.length) store.setProvider(providers[0]);
+        }),
+      DEFAULT_PROVIDER_RETRY_DELAYS,
+      (error) => console.warn("Default provider setup will retry on next launch:", error),
+    );
   }, []);
 
   useEffect(() => {

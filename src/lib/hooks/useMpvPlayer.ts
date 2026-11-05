@@ -549,7 +549,7 @@ export const useMpvPlayer = (opts?: UseMpvPlayerOptions) => {
               const streamUrl = resolved.streamUrl;
               const fileId = Number(streamUrl.match(/\/stream\/(\d+)/)?.[1] || 0);
 
-              // Warm up the stream — fetch the first chunk so librqbit
+              // Warm up the stream — fetch the first chunk so the engine
               // prioritizes downloading the beginning of the file.
               const dataDeadline = Date.now() + 60000;
               while (Date.now() < dataDeadline) {

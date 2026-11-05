@@ -21,3 +21,6 @@ plugins/**/.cxx/
 plugins/**/.tauri/
 plugins/**/target/
 
+
+# vega-torrentd build output and local vcpkg packages
+torrentd/vcpkg_installed/

@@ -801,15 +801,18 @@ pub fn run() {
                 .app_cache_dir()
                 .unwrap_or_else(|_| std::env::temp_dir())
                 .join("vega-torrents");
-            let torrent_state = tauri::async_runtime::block_on(async {
-                match torrent::TorrentState::new(torrent_cache_dir).await {
-                    Ok(state) => Some(state),
-                    Err(e) => {
-                        vlog_warn!("[torrent] Failed to initialize torrent engine: {}", e);
-                        None
-                    }
+            let torrent_state = match app
+                .path()
+                .resource_dir()
+                .map_err(anyhow::Error::from)
+                .and_then(|resources| torrent::TorrentState::start(&resources, torrent_cache_dir))
+            {
+                Ok(state) => Some(state),
+                Err(e) => {
+                    vlog_warn!("[torrent] Failed to start the torrent engine: {}", e);
+                    None
                 }
-            });
+            };
             app.manage(torrent_state);
 
             Ok(())
@@ -825,11 +828,6 @@ pub fn run() {
             generate_video_thumbnail,
             local_content::list_local_directory,
             get_torrent_api_port,
-            torrent::probe_swarms,
-            torrent::monitor_swarms,
-            torrent::swarm_stats,
-            torrent::stop_swarm_monitor,
-            torrent::claim_swarm_test,
             download_manager::start_download,
             download_manager::pause_download,
             download_manager::cancel_download,

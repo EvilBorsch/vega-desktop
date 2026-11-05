@@ -17,6 +17,7 @@
     ],
     "resources": [
       "resources/ffmpeg-sidecar/*",
+      "resources/torrentd/*",
       "lib/*.dll",
       "resources/windows/vc_redist.exe"
     ],

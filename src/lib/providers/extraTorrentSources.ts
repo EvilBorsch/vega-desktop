@@ -1056,6 +1056,88 @@ const searchWesternTarget = async (target: TorrentioTarget): Promise<Stream[]> =
   return [...byHash.values()].map(hit => westernToStream(hit));
 };
 
+// Stremio torrent addons that answer without an account, by IMDb id and episode.
+// Comet gathers releases from debrid caches, DMM, Torrentio and others;
+// Peerflix leans to Spanish and English releases. Live check (The Whale,
+// Project Hail Mary, American Crime Story S03E08): releases with peers that
+// Vega's other sources lacked, 68/118/3 (Comet) and 24/64/1 (Peerflix).
+export const STREMIO_ADDONS = [
+  {name: 'Comet', host: 'https://comet.feels.legal'},
+  {name: 'Peerflix', host: 'https://addon.peerflix.mov'},
+];
+// Releases an addon lists without a seeder count, at most: they are checked
+// by the scrape, the DHT probe and the speed test, but most have no peers.
+const ADDON_UNCOUNTED_LIMIT = 40;
+
+const FLAG_LANGUAGES: Record<string, string> = {
+  '🇷🇺': 'RU', '🇬🇧': 'EN', '🇺🇸': 'EN', '🇺🇦': 'UA', '🇫🇷': 'FR', '🇪🇸': 'ES', '🇲🇽': 'ES', '🇮🇹': 'IT',
+  '🇩🇪': 'DE', '🇵🇹': 'PT', '🇧🇷': 'PT', '🇯🇵': 'JA', '🇰🇷': 'KO', '🇨🇳': 'ZH', '🇮🇳': 'HI',
+};
+
+/** A stream of a Stremio torrent addon (Comet, Peerflix, ...) as a release. */
+export const addonToStream = (addon: string, item: any): Stream | undefined => {
+  const hash = String(item?.infoHash || '').toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(hash)) return undefined;
+  const text = String(item.description || item.title || '');
+  const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
+  const title = (lines[0] || item.behaviorHints?.filename || '').replace(/^📄\s*/, '').trim();
+  const seeders = text.match(/👤\s*(\d+)/)?.[1];
+  const flags = [...new Set([...text.matchAll(/[\u{1F1E6}-\u{1F1FF}]{2}/gu)].map(match => FLAG_LANGUAGES[match[0]]).filter(Boolean))];
+  const origin = text.match(/🔎\s*([^\n]+)/)?.[1]?.trim();
+  const size = text.match(/💾\s*([\d.,]+\s*[KMGT]B)/i)?.[1] || formatSize(Number(item.behaviorHints?.videoSize) || undefined);
+  const trackers = (Array.isArray(item.sources) ? item.sources : [])
+    .map((source: string) => String(source).replace(/^tracker:/, ''))
+    .filter((source: string) => /^(udp|https?):\/\//.test(source))
+    .slice(0, 10)
+    .map((source: string) => `&tr=${encodeURIComponent(source)}`)
+    .join('');
+  const quality = qualityFromTitle(`${title} ${item.name || ''}`);
+  const stream = releaseStream({
+    server: origin && !origin.toLowerCase().includes(addon.toLowerCase()) ? `${addon} · ${origin.split('|')[0].trim()}` : addon,
+    title,
+    magnet: `magnet:?xt=urn:btih:${hash}&dn=${encodeURIComponent(title)}${trackers}`,
+    quality,
+    seeders: seeders === undefined ? 0 : Number(seeders),
+    languages: flags.length ? flags : releaseLanguages(title, addon),
+    size,
+  });
+  // No count from the addon: say nothing rather than "0 seeders".
+  if (seeders === undefined) {
+    stream.tags = (stream.tags || []).filter(tag => tag !== '👤0');
+    stream.tag = (stream.tags || []).join(' • ');
+  }
+  return stream;
+};
+
+const searchAddon = (addon: {name: string; host: string}, target: TorrentioTarget): Promise<Stream[]> => {
+  const path = target.type === 'series' && target.season && target.episode
+    ? `/stream/series/${target.imdbId}:${target.season}:${target.episode}.json`
+    : `/stream/movie/${target.imdbId}.json`;
+  return cachedSearch(`addon:${addon.name}:${path}`, async () => {
+    const data = await getJson(addon.host, path, {});
+    if (!Array.isArray(data?.streams)) throw new Error(`Unexpected ${addon.name} response`);
+    let uncounted = 0;
+    return data.streams.flatMap((item: any) => {
+      const stream = addonToStream(addon.name, item);
+      if (!stream) return [];
+      const seeders = liveSeedersOf(stream);
+      if (seeders === 0 && /👤\s*0\b/.test(String(item.description || item.title || ''))) return [];
+      if (seeders === undefined && ++uncounted > ADDON_UNCOUNTED_LIMIT) return [];
+      return [stream];
+    });
+  });
+};
+
+const liveSeedersOf = (stream: Stream): number | undefined => {
+  const match = (stream.tags || []).join(' ').match(/👤\s*(\d+)/);
+  return match ? Number(match[1]) : undefined;
+};
+
+const searchAddonsTarget = async (target: TorrentioTarget): Promise<Stream[]> => {
+  const results = await Promise.allSettled(STREMIO_ADDONS.map(addon => searchAddon(addon, target)));
+  return fulfilled(results, 'Stremio addon');
+};
+
 // A live count outweighs an old snapshot of the same size.
 const swarmWeight = (stream: Stream): number => {
   const text = [...(stream.tags || []), stream.tag || ''].join(' ');
@@ -1082,13 +1164,14 @@ export const mergeByHash = (streams: Stream[]): Stream[] => {
 };
 
 const searchTarget = async (target: TorrentioTarget): Promise<Stream[]> => {
-  const [rutor, jacred, western] = await Promise.all([
+  const [rutor, jacred, western, addons] = await Promise.all([
     searchRutorTarget(target).catch(() => [] as Stream[]),
     searchJacredTarget(target).catch(() => [] as Stream[]),
     searchWesternTarget(target).catch(() => [] as Stream[]),
+    searchAddonsTarget(target).catch(() => [] as Stream[]),
   ]);
-  const streams = mergeByHash([...rutor, ...jacred, ...western]);
-  console.log(`Extra torrent sources for ${target.imdbId}: Rutor ${rutor.length}, JacRed ${jacred.length}, international ${western.length}, unique ${streams.length}`);
+  const streams = mergeByHash([...rutor, ...jacred, ...western, ...addons]);
+  console.log(`Extra torrent sources for ${target.imdbId}: Rutor ${rutor.length}, JacRed ${jacred.length}, international ${western.length}, addons ${addons.length}, unique ${streams.length}`);
   return streams;
 };
 

@@ -1,10 +1,10 @@
 import {useCallback, useMemo, useState} from 'react';
 import {useQuery} from '@tanstack/react-query';
-import {invoke} from '@tauri-apps/api/core';
+import {torrentEngine} from '../services/torrentEngine';
 import type {Stream} from '../providers/types';
 import {isTauriRuntime} from '../../platform/host';
 
-/** Peers the DHT returned per info hash (Rust `probe_swarms`). */
+/** Peers the DHT returned per info hash (the engine's /swarm/probe). */
 export type SwarmProbe = {peers: Record<string, number>};
 
 const DEAD_KEY = 'DeadReleases:v1';
@@ -18,6 +18,35 @@ export const streamInfoHash = (stream?: Pick<Stream, 'link'>): string | undefine
 export const liveSeeders = (stream: Pick<Stream, 'tag' | 'tags'>): number | undefined => {
   const match = [...(stream.tags || []), stream.tag || ''].join(' ').match(/👤\s*(\d+)/);
   return match ? Number(match[1]) : undefined;
+};
+
+/** Live seeders and leechers from public trackers (UDP scrape), per info hash. */
+export type SwarmScrape = Record<string, {seeders: number; leechers: number; trackers?: number}>;
+
+// Swarm counts in a release's labels: live (👤, ⬇), an old snapshot (≈) or DHT peers (👥).
+const SWARM_TAG = /^(?:👤\s*\d+|S:\s*\d+|⬇\s*\d+|≈\d+ seeders.*|👥\s*\d+)$/i;
+
+/**
+ * The release with its swarm counts replaced by what public trackers say now.
+ * Index snapshots are often months old (JacRed matched a live scrape for 15%
+ * of releases); an index's own live count is kept when it is higher, as it
+ * may know trackers the scrape did not ask.
+ */
+export const withLiveCounts = (stream: Stream, live?: {seeders: number; leechers: number}): Stream => {
+  if (!live || live.seeders + live.leechers <= 0) return stream;
+  const seeders = Math.max(live.seeders, liveSeeders(stream) || 0);
+  const swarm = [`👤${seeders}`, ...(live.leechers > 0 ? [`⬇${live.leechers}`] : [])];
+  const splice = (parts: string[]) => {
+    const at = parts.findIndex(part => SWARM_TAG.test(part.trim()));
+    const kept = parts.filter(part => !SWARM_TAG.test(part.trim()));
+    const position = at < 0 ? Math.min(1, kept.length) : at;
+    return [...kept.slice(0, position), ...swarm, ...kept.slice(position)];
+  };
+  return {
+    ...stream,
+    tags: splice(stream.tags || []),
+    tag: stream.tag ? splice(stream.tag.split(' • ')).join(' • ') : stream.tag,
+  };
 };
 
 /**
@@ -67,11 +96,14 @@ export const applySwarmHealth = (
   probe: SwarmProbe | undefined,
   dead: Set<string>,
   keep: Set<string>,
+  scrape?: SwarmScrape,
 ): {visible: Stream[]; hidden: Stream[]} => {
   const conclusive = probeIsConclusive(probe);
   const visible: Stream[] = [];
   const hidden: Stream[] = [];
-  for (const stream of streams) {
+  for (const listed of streams) {
+    const listedHash = streamInfoHash(listed);
+    const stream = listedHash && scrape ? withLiveCounts(listed, scrape[listedHash]) : listed;
     const hash = streamInfoHash(stream);
     // The release playing now stays; one that found no peer when played goes,
     // even if Resume remembers it; a remembered one is never hidden by a probe.
@@ -103,18 +135,27 @@ export const useSwarmHealth = (
     [streams],
   );
   const [deadVersion, setDeadVersion] = useState(0);
+  // Live counts from public trackers, asked once per list.
+  const {data: scrape} = useQuery({
+    queryKey: ['swarmScrape', hashes.join(',')],
+    queryFn: async (): Promise<SwarmScrape> => torrentEngine<SwarmScrape>('/swarm/scrape', {hashes}),
+    enabled: enabled && isTauriRuntime() && hashes.length > 0,
+    staleTime: 5 * 60 * 1000,
+    gcTime: 30 * 60 * 1000,
+    retry: false,
+  });
   const {data: probe, isFetching} = useQuery({
     queryKey: ['swarmProbe', hashes.join(',')],
-    queryFn: async (): Promise<SwarmProbe> => ({peers: await invoke<Record<string, number>>('probe_swarms', {hashes})}),
+    queryFn: async (): Promise<SwarmProbe> => ({peers: await torrentEngine<Record<string, number>>('/swarm/probe', {hashes})}),
     enabled: enabled && isTauriRuntime() && hashes.length > 0,
     staleTime: 10 * 60 * 1000,
     gcTime: 30 * 60 * 1000,
     retry: false,
   });
   const result = useMemo(
-    () => applySwarmHealth(streams, probe, deadReleases(), keep),
+    () => applySwarmHealth(streams, probe, deadReleases(), keep, scrape),
     // deadVersion re-reads the dead list after a release is marked.
-    [streams, probe, keep, deadVersion],
+    [streams, probe, keep, deadVersion, scrape],
   );
   const markDead = useCallback((hash: string) => {
     markReleaseDead(hash);

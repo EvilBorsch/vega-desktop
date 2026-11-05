@@ -192,7 +192,7 @@ export const useDownloadStore = create<DownloadState>()(
               `http://127.0.0.1:${apiPort}/torrents?output_folder=${encodeURIComponent(item.filePath)}&overwrite=true`,
               { method: "POST", body: item.url },
             );
-            if (!res.ok) throw new Error("Failed to add torrent to librqbit");
+            if (!res.ok) throw new Error("Failed to add the torrent to the engine");
             const data = await res.json();
             if (data?.details?.info_hash) {
               set((state) => ({

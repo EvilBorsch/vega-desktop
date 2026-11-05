@@ -35,9 +35,9 @@ export function getInfoHashFromStreamUrl(streamUrl?: string | null): string | nu
   return match ? match[1].toLowerCase() : null;
 }
 
-// librqbit waits for a magnet's metadata inside POST /torrents, by default for
-// ten minutes. An attempt is cut short instead and added again: a fresh add
-// re-announces to trackers and the DHT, which is what re-opening a source did.
+// The engine waits for a magnet's metadata inside POST /torrents for timeout_ms.
+// An attempt is cut short and made again: a new attempt re-announces to
+// trackers and the DHT, which is what re-opening a source did.
 const METADATA_TIMEOUT_MS = 30_000;
 const MAX_ADD_ATTEMPTS = 3;
 
@@ -55,7 +55,7 @@ const status = () => useTorrentStatusStore.getState();
 const formatSpeed = (mbps?: number) =>
   mbps && mbps > 0.01 ? (mbps >= 1 ? `${mbps.toFixed(1)} MB/s` : `${Math.round(mbps * 1024)} KB/s`) : "";
 
-/** Peers, speed and progress of a torrent librqbit already has. */
+/** Peers, speed and progress of a torrent the engine already has. */
 export async function torrentStatsLine(apiPort: number, infoHash: string, signal?: AbortSignal): Promise<string> {
   const res = await fetch(`http://127.0.0.1:${apiPort}/torrents/${infoHash}/stats/v1`, { signal });
   if (!res.ok) return "";
@@ -115,7 +115,7 @@ async function addTorrent(apiPort: number, torrentUrl: string, signal?: AbortSig
 }
 
 /**
- * Resolves a magnet URL or .torrent into a local HTTP streaming URL served by librqbit.
+ * Resolves a magnet URL into a local HTTP streaming URL served by the torrent engine.
  */
 export async function resolveTorrentStream(
   torrentUrl: string,
@@ -134,7 +134,7 @@ export async function resolveTorrentStream(
 
   const apiPort = await invoke<number>("get_torrent_api_port");
 
-  // 1. Add torrent to librqbit session, again if its metadata does not come.
+  // 1. Add the torrent to the engine, again if its metadata does not come.
   let data: any;
   for (let attempt = 1; ; attempt++) {
     try {
@@ -294,7 +294,7 @@ export function stopTorrentStatus(clear = true): void {
 }
 
 /**
- * Resolves a magnet URL or .torrent into a local HTTP streaming URL served by librqbit.
+ * Resolves a magnet URL into a local HTTP streaming URL served by the torrent engine.
  */
 export async function resolveTorrentStreamUrl(
   torrentUrl: string,
@@ -308,7 +308,7 @@ export async function resolveTorrentStreamUrl(
 }
 
 /**
- * Pauses or cleans up an active streaming torrent in librqbit.
+ * Pauses an active streaming torrent in the engine.
  */
 export async function pauseTorrentStream(infoHash: string): Promise<void> {
   try {
@@ -320,7 +320,7 @@ export async function pauseTorrentStream(infoHash: string): Promise<void> {
 }
 
 /**
- * Deletes a torrent stream and removes downloaded files from disk via librqbit.
+ * Deletes a torrent stream and its downloaded files via the engine.
  * Verifies that the torrent is not a saved item in user's downloads before deleting.
  */
 export async function deleteTorrentStream(infoHash: string): Promise<void> {
